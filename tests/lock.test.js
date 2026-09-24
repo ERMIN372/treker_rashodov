@@ -34,3 +34,11 @@ test('пауза после неудачных попыток растёт и о
   assert.equal(formatWait(90_000), '1 мин 30 с');
   assert.equal(formatWait(120_000), '2 мин');
 });
+
+test('ошибки Face ID объясняются по-русски и с кодом', async () => {
+  const { describeBiometricError } = await import('../app/js/lock.js');
+  const e = (name, message = '') => Object.assign(new Error(message), { name });
+  assert.match(describeBiometricError(e('NotAllowedError')), /не разрешила.*\(NotAllowedError\)/);
+  assert.match(describeBiometricError(e('NotSupportedError')), /не поддерживают/);
+  assert.equal(describeBiometricError(e('WeirdError', 'boom')), 'boom (WeirdError)');
+});
