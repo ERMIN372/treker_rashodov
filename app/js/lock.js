@@ -57,12 +57,32 @@ export function formatWait(ms) {
 // Сервера нет, поэтому подпись не проверяем: нам нужно только, чтобы
 // система подтвердила личность (флаг UV) именно для нашего запроса.
 
+// Умеет ли браузер WebAuthn вообще (синхронно, без вопросов к системе)
+export const webauthnSupported = () =>
+  typeof window !== 'undefined' && 'PublicKeyCredential' in window && typeof navigator.credentials?.create === 'function';
+
+// Ответ системы «есть ли Face ID / Touch ID для сайтов». С iOS 26.2 он «да» только
+// при настроенном провайдере паролей (приложение «Пароли» или, например, 1Password),
+// а в некоторых сборках бывал ложным «нет» — поэтому это лишь подсказка, а не запрет.
 export async function biometricAvailable() {
   try {
     return Boolean(window.PublicKeyCredential) && (await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
   } catch {
     return false;
   }
+}
+
+// Понятное объяснение ошибки WebAuthn (+ код, чтобы было что загуглить)
+export function describeBiometricError(err) {
+  const name = err?.name ?? 'Error';
+  const text = {
+    NotAllowedError: 'отменено или система не разрешила сохранить ключ входа',
+    NotSupportedError: 'устройство или браузер не поддерживают вход по биометрии',
+    SecurityError: 'браузер запретил вход по биометрии для этого адреса',
+    InvalidStateError: 'ключ входа уже есть — выключи и включи переключатель снова',
+    AbortError: 'отменено',
+  }[name] ?? (err?.message || 'неизвестная ошибка');
+  return `${text} (${name})`;
 }
 
 export function biometricName(ua = navigator.userAgent) {

@@ -1033,6 +1033,7 @@ function syncSection() {
 // ---------- Блокировка PIN-кодом ----------
 // PIN и Face ID — настройки конкретного устройства, в синхронизацию не попадают.
 
+const IOS_PASSWORDS_TIP = 'Проверь: Настройки → Основные → Автозаполнение и пароли → включи «Пароли» (нужен вход в iCloud), затем полностью закрой и снова открой трекер.';
 const AUTOLOCK_OPTIONS = [[0, 'Сразу'], [60_000, '1 мин'], [300_000, '5 мин'], [900_000, '15 мин']];
 const IDLE_LOCK_MS = 5 * 60_000; // бездействие при открытом приложении (актуально для компа)
 
@@ -1045,14 +1046,20 @@ const lock = {
   lockedUntil: 0,
   hiddenAt: null,
   lastActivity: Date.now(),
-  bioAvailable: false,
+  bioAvailable: false, // ответ системы — только подсказка, на iOS бывает ложным «нет»
+  webauthn: Lock.webauthnSupported(),
+  bioError: '',
   message: '',
   shake: false,
   timer: null,
 };
 const lockEl = $('#lock');
 const bioName = Lock.biometricName();
-const canUseBio = () => Boolean(lock.record?.credentialId) && lock.bioAvailable;
+const isApple = isIOS || /Macintosh/.test(navigator.userAgent);
+const canUseBio = () => Boolean(lock.record?.credentialId) && lock.webauthn;
+// На устройствах Apple переключатель показываем, даже если система ответила «нет»:
+// с iOS 26.2 это часто значит «не настроено приложение Пароли», а не «нет Face ID»
+const showBioToggle = () => lock.webauthn && (lock.bioAvailable || isApple);
 
 async function saveLockRecord(record) {
   lock.record = record;
@@ -1297,7 +1304,7 @@ function openPinSheet(mode) {
       const pinRecord = await Lock.createPinRecord(next.value);
       await saveLockRecord({ autoLockMs: 60_000, credentialId: null, ...lock.record, ...pinRecord });
       render();
-      toast(mode === 'set' && lock.bioAvailable ? `PIN-код установлен. Ниже можно включить вход по ${bioName}` : 'PIN-код сохранён');
+      toast(mode === 'set' && showBioToggle() ? `PIN-код установлен. Ниже можно включить вход по ${bioName}` : 'PIN-код сохранён');
       return true;
     },
   });
@@ -1312,23 +1319,38 @@ async function toggleBiometric(input) {
   }
   try {
     const credentialId = await Lock.registerBiometric(); // без await до вызова — Safari нужен жест
+    lock.bioError = '';
     await saveLockRecord({ ...lock.record, credentialId });
     toast(`Вход по ${bioName} включён`);
   } catch (err) {
     console.warn(err);
     input.checked = false;
-    toast(`Не получилось включить ${bioName}`);
+    lock.bioError = `Не получилось включить ${bioName}: ${Lock.describeBiometricError(err)}.`;
   }
+  if (!sheet.open) renderSettings();
+}
+
+// Что сказать под переключателем Face ID, если что-то не так
+function bioHint() {
+  if (lock.bioError) {
+    return [h('p', { class: 'form-error left' }, lock.bioError), isIOS && h('p', { class: 'hint tip' }, IOS_PASSWORDS_TIP)];
+  }
+  if (!lock.record?.credentialId && !lock.bioAvailable) {
+    return h('p', { class: 'hint' }, isIOS
+      ? `iOS отвечает, что вход по Face ID для сайтов сейчас не настроен. ${IOS_PASSWORDS_TIP} Можно попробовать включить и так.`
+      : `Система отвечает, что ${bioName} для сайтов не настроен. Можно попробовать включить и так.`);
+  }
+  return null;
 }
 
 function securitySection() {
   if (!lock.record) {
     return h('div', { class: 'card pad' },
-      h('p', { class: 'hint' }, `PIN-код на вход${lock.bioAvailable ? ` и ${bioName}` : ''}: приложение спросит его при открытии и после сворачивания.`),
+      h('p', { class: 'hint' }, `PIN-код на вход${showBioToggle() ? ` и ${bioName}` : ''}: приложение спросит его при открытии и после сворачивания.`),
       h('div', { class: 'btn-stack' },
         h('button', { type: 'button', class: 'btn primary', onclick: () => openPinSheet('set') }, '🔒 Поставить PIN-код')));
   }
-  const bioSwitch = lock.bioAvailable && h('input', {
+  const bioSwitch = showBioToggle() && h('input', {
     type: 'checkbox',
     class: 'switch',
     checked: Boolean(lock.record.credentialId),
@@ -1338,6 +1360,7 @@ function securitySection() {
   return h('div', { class: 'card pad' },
     h('p', { class: 'sync-status' }, '🔒 Вход по PIN-коду включён'),
     bioSwitch && h('label', { class: 'toggle-row inset' }, h('span', null, `Входить по ${bioName}`), bioSwitch),
+    bioSwitch && bioHint(),
     field('Блокировать после сворачивания',
       segmented(AUTOLOCK_OPTIONS, lock.record.autoLockMs ?? 60_000, async (ms) => {
         await saveLockRecord({ ...lock.record, autoLockMs: ms });

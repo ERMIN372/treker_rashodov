@@ -962,3 +962,7 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 html.privacy body > :not(#lock) { visibility: hidden; }
 
 .lock-screen:focus { outline: none; }
+
+.form-error.left { margin: -4px 0 12px; text-align: left; }
+
+.hint.tip { margin: -6px 0 12px; }
