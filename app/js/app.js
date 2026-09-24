@@ -1,6 +1,7 @@
 import { db } from './db.js';
 import * as L from './logic.js';
 import { columnChart } from './charts.js';
+import { createGitHubClient, syncOnce } from './sync.js';
 
 // При деплое метка заменяется на короткий хэш коммита (см. .github/workflows/pages.yml).
 // Сравнивать с самой меткой нельзя — sed заменит и её, поэтому проверяем префикс.
@@ -25,6 +26,8 @@ const state = {
   filterCategory: null,
   lastBackup: null,
   backupSnooze: null,
+  // id удалённых записей: удаления хранятся «надгробиями» ради синхронизации
+  tombstones: Object.fromEntries(L.SYNC_STORES.map((s) => [s, new Set()])),
 };
 
 // ---------- DOM-хелперы ----------
@@ -61,6 +64,50 @@ function upsert(list, item) {
 function removeById(list, id) {
   const i = list.findIndex((x) => x.id === id);
   if (i >= 0) list.splice(i, 1);
+}
+
+// ---------- Данные ----------
+
+// Единая точка записи: ставит время изменения, удаление превращает в «надгробие»,
+// обновляет состояние и планирует синхронизацию.
+// ops: [{ store, put: запись } | { store, delete: запись }]; stamp: false — не трогать updatedAt
+async function persist(ops, { stamp = true } = {}) {
+  const now = Date.now();
+  const writes = ops.map(({ store, put, delete: del }) => ({
+    store,
+    put: del ? { id: del.id, deleted: true, updatedAt: now } : stamp ? { ...put, updatedAt: now } : put,
+  }));
+  await db.bulk(writes);
+  for (const { store, put } of writes) {
+    if (put.deleted) {
+      removeById(state[store], put.id);
+      state.tombstones[store].add(put.id);
+    } else {
+      upsert(state[store], put);
+      state.tombstones[store].delete(put.id);
+    }
+  }
+  markSyncDirty();
+}
+
+// Все записи вместе с «надгробиями» — в таком виде их видит синхронизация
+const localData = {
+  async getAll() {
+    const lists = await Promise.all(L.SYNC_STORES.map((s) => db.getAll(s)));
+    return Object.fromEntries(L.SYNC_STORES.map((s, i) => [s, lists[i]]));
+  },
+  apply: (changes) => db.mergeIn(changes, (store, cur, incoming) => {
+    const next = cur ? L.resolveRecord(cur, incoming, store) : incoming;
+    return !cur || L.recordKey(next) !== L.recordKey(cur) ? next : null;
+  }),
+};
+
+async function loadState() {
+  const all = await localData.getAll();
+  for (const name of L.SYNC_STORES) {
+    state[name] = all[name].filter((r) => !r.deleted);
+    state.tombstones[name] = new Set(all[name].filter((r) => r.deleted).map((r) => r.id));
+  }
 }
 
 const catById = (id) => state.categories.find((c) => c.id === id) ?? { id, type: 'expense', name: 'Без категории', emoji: '❔' };
@@ -108,6 +155,7 @@ function hideToast() {
 
 const sheet = $('#sheet');
 let reloadWhenSheetCloses = false;
+let renderWhenSheetCloses = false;
 
 function openSheet({ title, body, onSave }) {
   let saving = false; // двойной тап по «Готово» не должен создать дубль
@@ -143,8 +191,13 @@ function closeSheet() {
 
 sheet.addEventListener('click', (e) => e.target === sheet && closeSheet());
 sheet.addEventListener('close', () => {
+  stopScanner();
   sheet.replaceChildren();
   if (reloadWhenSheetCloses) location.reload();
+  if (renderWhenSheetCloses) {
+    renderWhenSheetCloses = false;
+    render();
+  }
 });
 
 // ---------- Элементы форм ----------
@@ -264,8 +317,7 @@ function openTxSheet(tx = null) {
         date: date.value,
         note: note.value.trim(),
       };
-      await db.put('transactions', item);
-      upsert(state.transactions, item);
+      await persist([{ store: 'transactions', put: item }]);
       const monthChanged = L.monthKey(item.date) !== state.month;
       state.month = L.monthKey(item.date);
       render();
@@ -278,15 +330,13 @@ function openTxSheet(tx = null) {
 }
 
 async function deleteTx(tx) {
-  await db.delete('transactions', tx.id);
-  removeById(state.transactions, tx.id);
+  await persist([{ store: 'transactions', delete: tx }]);
   closeSheet();
   render();
   toast('Операция удалена', {
     label: 'Вернуть',
     run: async () => {
-      await db.put('transactions', tx);
-      upsert(state.transactions, tx);
+      await persist([{ store: 'transactions', put: tx }]);
       render();
     },
   });
@@ -295,27 +345,32 @@ async function deleteTx(tx) {
 // ---------- Регулярные платежи ----------
 
 // Записывает все наступившие платежи. id операции детерминирован
-// (правило + дата), поэтому повторный запуск не создаст дублей.
+// (правило + дата), поэтому ни повторный запуск, ни второе устройство дублей не создадут.
+// Время изменения у автоплатежа нулевое: любая ручная правка или удаление
+// (на любом устройстве) всегда сильнее автоматической записи.
 let recurringRun = null;
 function applyRecurring() {
   recurringRun ??= (async () => {
     const today = L.todayISO();
-    const newTx = [];
-    const updated = [];
+    const known = new Set([...state.transactions.map((t) => t.id), ...state.tombstones.transactions]);
+    const ops = [];
+    let added = 0;
     for (const r of state.recurring) {
       if (!r.active) continue;
       const dates = L.dueOccurrences(r, today);
       if (!dates.length) continue;
       for (const date of dates) {
-        newTx.push({ id: `rec-${r.id}-${date}`, type: r.type, amount: r.amount, categoryId: r.categoryId, date, note: r.note ?? '', recurringId: r.id, createdAt: Date.now() });
+        const id = `rec-${r.id}-${date}`;
+        if (known.has(id)) continue;
+        ops.push({ store: 'transactions', put: { id, type: r.type, amount: r.amount, categoryId: r.categoryId, date, note: r.note ?? '', recurringId: r.id, createdAt: 0, updatedAt: 0 } });
+        added += 1;
       }
-      updated.push({ ...r, lastDate: dates.at(-1) });
+      // lastDate при слиянии берётся максимальный, поэтому время правки правила не трогаем
+      ops.push({ store: 'recurring', put: { ...r, lastDate: dates.at(-1) } });
     }
-    if (!updated.length) return 0;
-    await db.bulk([...newTx.map((t) => ({ store: 'transactions', put: t })), ...updated.map((r) => ({ store: 'recurring', put: r }))]);
-    newTx.forEach((t) => upsert(state.transactions, t));
-    updated.forEach((r) => upsert(state.recurring, r));
-    return newTx.length;
+    if (!ops.length) return 0;
+    await persist(ops, { stamp: false });
+    return added;
   })().finally(() => {
     recurringRun = null;
   });
@@ -400,8 +455,7 @@ function openRuleSheet(rule = null) {
         const yesterday = L.addDays(today, -1);
         item.lastDate = rule.lastDate && rule.lastDate > yesterday ? rule.lastDate : yesterday;
       }
-      await db.put('recurring', item);
-      upsert(state.recurring, item);
+      await persist([{ store: 'recurring', put: item }]);
       const added = await applyRecurring();
       render();
       toast(added ? `Сохранено, записано платежей: ${added}` : 'Сохранено');
@@ -412,15 +466,13 @@ function openRuleSheet(rule = null) {
 }
 
 async function deleteRule(rule) {
-  await db.delete('recurring', rule.id);
-  removeById(state.recurring, rule.id);
+  await persist([{ store: 'recurring', delete: rule }]);
   closeSheet();
   render();
   toast('Удалено. Уже записанные операции остались', {
     label: 'Вернуть',
     run: async () => {
-      await db.put('recurring', rule);
-      upsert(state.recurring, rule);
+      await persist([{ store: 'recurring', put: rule }]);
       render();
     },
   });
@@ -459,8 +511,7 @@ function openCategorySheet(cat, type) {
       }
       const maxOrder = Math.max(0, ...state.categories.map((c) => c.order ?? 0));
       const item = { ...(cat ?? { id: uid(), type, order: maxOrder + 1 }), name: title, emoji: firstGrapheme(emoji.value) || '🏷️' };
-      await db.put('categories', item);
-      upsert(state.categories, item);
+      await persist([{ store: 'categories', put: item }]);
       render();
       return true;
     },
@@ -474,14 +525,11 @@ async function deleteCategory(cat) {
   const rules = state.recurring.filter((r) => r.categoryId === cat.id).map((r) => ({ ...r, categoryId: other }));
   const moved = txs.length ? ` ${txs.length} ${L.plural(txs.length, TX_FORMS)} перейдут в «${catById(other).name}».` : '';
   if (!confirm(`Удалить категорию «${cat.name}»?${moved}`)) return;
-  await db.bulk([
+  await persist([
     ...txs.map((t) => ({ store: 'transactions', put: t })),
     ...rules.map((r) => ({ store: 'recurring', put: r })),
-    { store: 'categories', delete: cat.id },
+    { store: 'categories', delete: cat },
   ]);
-  txs.forEach((t) => upsert(state.transactions, t));
-  rules.forEach((r) => upsert(state.recurring, r));
-  removeById(state.categories, cat.id);
   if (state.filterCategory === cat.id) state.filterCategory = null;
   closeSheet();
   render();
@@ -535,23 +583,449 @@ async function importBackup(file) {
   }
   const cur = state.transactions.length;
   const next = data.transactions.length;
-  if (!confirm(`Заменить текущие данные (${cur} ${L.plural(cur, TX_FORMS)}) данными из копии (${next} ${L.plural(next, TX_FORMS)})? Текущие данные пропадут.`)) return;
+  const everywhere = sync.config ? ' Замена разойдётся и на другие устройства.' : '';
+  if (!confirm(`Заменить текущие данные (${cur} ${L.plural(cur, TX_FORMS)}) данными из копии (${next} ${L.plural(next, TX_FORMS)})?${everywhere} Текущие данные пропадут.`)) return;
   data.categories = L.withRequiredCategories(data.categories);
-  await db.replaceAll(data);
-  Object.assign(state, data, { filterCategory: null });
+  // Копия должна победить при синхронизации: её записи — «свежие»,
+  // а всё, чего в ней нет, удаляется «надгробиями»
+  const now = Date.now();
+  const replaced = Object.fromEntries(L.SYNC_STORES.map((name) => {
+    const incoming = data[name].map((r) => ({ ...r, updatedAt: now }));
+    const keep = new Set(incoming.map((r) => r.id));
+    const gone = [...state[name].map((r) => r.id), ...state.tombstones[name]].filter((id) => !keep.has(id));
+    return [name, [...incoming, ...gone.map((id) => ({ id, deleted: true, updatedAt: now }))]];
+  }));
+  await db.replaceAll(replaced);
+  await loadState();
+  state.filterCategory = null;
+  markSyncDirty();
   await applyRecurring();
   render();
   toast('Данные восстановлены из копии');
 }
 
 async function clearAll() {
-  if (!confirm('Удалить все операции, категории и регулярные платежи? Сначала лучше сохранить резервную копию.')) return;
-  if (!confirm('Точно удалить? Вернуть можно будет только из резервной копии.')) return;
+  if (sync.config) {
+    if (!confirm('Удалить все данные с этого устройства? Синхронизация здесь отключится, а данные в GitHub-репозитории и на других устройствах останутся.')) return;
+  } else {
+    if (!confirm('Удалить все операции, категории и регулярные платежи? Сначала лучше сохранить резервную копию.')) return;
+    if (!confirm('Точно удалить? Вернуть можно будет только из резервной копии.')) return;
+  }
+  await disconnectSync();
   await db.clearAll();
-  Object.assign(state, { transactions: [], recurring: [], categories: L.defaultCategories(), filterCategory: null, lastBackup: null, backupSnooze: null });
+  Object.assign(state, {
+    transactions: [],
+    recurring: [],
+    categories: L.defaultCategories(),
+    tombstones: Object.fromEntries(L.SYNC_STORES.map((s) => [s, new Set()])),
+    filterCategory: null,
+    lastBackup: null,
+    backupSnooze: null,
+  });
   await db.bulk(state.categories.map((c) => ({ store: 'categories', put: c })));
   render();
   toast('Все данные удалены');
+}
+
+// ---------- Синхронизация ----------
+
+// Подменить адрес API можно только на localhost — для тестов с имитацией GitHub
+const API_OVERRIDE = ['localhost', '127.0.0.1'].includes(location.hostname) ? new URLSearchParams(location.search).get('api') : null;
+const SYNC_LABEL = { off: 'Синхронизация выключена', syncing: 'Идёт синхронизация', ok: 'Синхронизировано', error: 'Ошибка синхронизации' };
+const FATAL_ON_CONNECT = new Set(['auth', 'forbidden', 'not-found', 'public', 'http', 'rate', undefined]);
+
+const sync = {
+  config: null, // { repo, token }
+  etag: null,
+  sha: null,
+  dirty: false,
+  seq: 0, // счётчик локальных правок — чтобы не потерять правку, сделанную во время синхронизации
+  status: 'off',
+  error: null,
+  errorCode: null,
+  lastAt: null,
+  running: null,
+  again: false,
+  timer: null,
+  errorToasted: false,
+};
+
+const syncClient = (config) => createGitHubClient({ repo: config.repo, token: config.token, api: API_OVERRIDE ?? undefined });
+
+function saveSyncState() {
+  return db.setMeta('syncState', { etag: sync.etag, sha: sync.sha, dirty: sync.dirty, lastAt: sync.lastAt }).catch(() => {});
+}
+
+function markSyncDirty() {
+  if (!sync.config) return;
+  sync.dirty = true;
+  sync.seq += 1;
+  saveSyncState();
+  clearTimeout(sync.timer);
+  sync.timer = setTimeout(() => runSync(), 1500);
+}
+
+// Точка на вкладке «Настройки»: синяя — идёт синхронизация, красная — ошибка
+function updateSyncBadge() {
+  const dot = $('#syncDot');
+  const visible = Boolean(sync.config) && (sync.status === 'syncing' || sync.status === 'error');
+  dot.hidden = !visible;
+  dot.className = `sync-dot is-${sync.status}`;
+  const tab = $('.tab[data-tab="settings"]');
+  if (visible) tab.setAttribute('aria-label', `Настройки: ${SYNC_LABEL[sync.status].toLowerCase()}`);
+  else tab.removeAttribute('aria-label');
+}
+
+function setSyncStatus(status) {
+  sync.status = status;
+  updateSyncBadge();
+  if (state.tab === 'settings' && !sheet.open) renderSettings();
+}
+
+// Один запуск за раз; просьбы во время работы склеиваются в один повтор. → { ok, error }
+function runSync() {
+  if (!sync.config) return Promise.resolve({ ok: false });
+  if (sync.running) {
+    sync.again = true;
+    return sync.running;
+  }
+  sync.running = (async () => {
+    const seq = sync.seq;
+    setSyncStatus('syncing');
+    try {
+      const res = await syncOnce({
+        client: syncClient(sync.config),
+        local: localData,
+        etag: sync.etag,
+        sha: sync.sha,
+        dirty: sync.dirty,
+        deviceName: L.deviceName(navigator.userAgent),
+      });
+      Object.assign(sync, { etag: res.etag, sha: res.sha, lastAt: Date.now(), error: null, errorCode: null, errorToasted: false });
+      if (sync.seq === seq) sync.dirty = false;
+      await saveSyncState();
+      if (res.pulled) {
+        await loadState();
+        await applyRecurring();
+        if (sheet.open) renderWhenSheetCloses = true;
+        else render();
+        if (document.visibilityState === 'visible') toast('Подтянуты изменения с другого устройства');
+      }
+      setSyncStatus('ok');
+      return { ok: true };
+    } catch (err) {
+      console.warn('Синхронизация:', err);
+      Object.assign(sync, { error: err?.message ?? String(err), errorCode: err?.code });
+      if (err?.code === 'conflict') sync.etag = null;
+      setSyncStatus('error');
+      if (!sync.errorToasted && err?.code !== 'network') {
+        sync.errorToasted = true;
+        toast(`Синхронизация: ${sync.error}`);
+      }
+      return { ok: false, error: err };
+    }
+  })().finally(() => {
+    sync.running = null;
+    if (sync.again) {
+      sync.again = false;
+      runSync();
+    }
+  });
+  return sync.running;
+}
+
+// Проверяет доступ, делает первую синхронизацию; при ошибке ничего не сохраняет
+async function connectSync(config) {
+  await syncClient(config).checkRepo();
+  clearTimeout(sync.timer);
+  Object.assign(sync, { config, etag: null, sha: null, dirty: true, error: null, errorCode: null, errorToasted: true });
+  const result = await runSync();
+  if (!result.ok && FATAL_ON_CONNECT.has(result.error?.code)) {
+    Object.assign(sync, { config: null, status: 'off' });
+    updateSyncBadge();
+    throw result.error;
+  }
+  sync.errorToasted = false;
+  await db.setMeta('syncConfig', config);
+}
+
+async function disconnectSync() {
+  clearTimeout(sync.timer);
+  const inFlight = sync.running;
+  sync.config = null; // повтор после текущего запуска уже не случится
+  // Дождаться текущего запуска, иначе он допишет данные после очистки
+  if (inFlight) await inFlight;
+  Object.assign(sync, { config: null, etag: null, sha: null, dirty: false, status: 'off', error: null, errorCode: null, lastAt: null });
+  await db.setMeta('syncConfig', null);
+  await saveSyncState();
+  updateSyncBadge();
+}
+
+const scripts = new Map();
+function loadScript(src) {
+  if (!scripts.has(src)) {
+    scripts.set(src, new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src;
+      el.onload = resolve;
+      el.onerror = () => {
+        scripts.delete(src);
+        reject(new Error('Не удалось загрузить сканер — нужен интернет.'));
+      };
+      document.head.append(el);
+    }));
+  }
+  return scripts.get(src);
+}
+
+let stopScanner = () => {};
+
+// Сканирует QR камерой прямо в приложении (iOS не умеет передать
+// результат из «Камеры» в приложение с экрана «Домой» — у них разные хранилища)
+async function scanQR(box) {
+  stopScanner();
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('Камера здесь недоступна — вставь ключ вручную.');
+  await loadScript('./vendor/jsQR.js');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+  } catch {
+    throw new Error('Нет доступа к камере — разреши его или вставь ключ вручную.');
+  }
+  const video = h('video', { playsinline: true, autoplay: true, 'aria-label': 'Камера' });
+  video.muted = true;
+  video.srcObject = stream;
+  box.hidden = false;
+  mount(box, video, h('button', { type: 'button', class: 'chip', onclick: () => stopScanner() }, 'Остановить'));
+  await video.play().catch(() => {});
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  return new Promise((resolve) => {
+    let raf = 0;
+    const finish = (value) => {
+      cancelAnimationFrame(raf);
+      stream.getTracks().forEach((t) => t.stop());
+      box.hidden = true;
+      box.replaceChildren();
+      stopScanner = () => {};
+      resolve(value);
+    };
+    stopScanner = () => finish(null);
+    const tick = () => {
+      if (video.readyState >= 2 && video.videoWidth) {
+        const scale = Math.min(1, 720 / video.videoWidth);
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+        if (code?.data) return finish(code.data);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+  });
+}
+
+async function qrSvg(text) {
+  const { default: qrcode } = await import('../vendor/qrcode.js');
+  const qr = qrcode(0, 'M');
+  qr.addData(text);
+  qr.make();
+  const n = qr.getModuleCount();
+  const pad = 4; // «тихая зона» вокруг кода, без неё камеры читают хуже
+  let d = '';
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) if (qr.isDark(r, c)) d += `M${c + pad} ${r + pad}h1v1h-1z`;
+  }
+  const NS = 'http://www.w3.org/2000/svg';
+  const svgEl = document.createElementNS(NS, 'svg');
+  svgEl.setAttribute('viewBox', `0 0 ${n + pad * 2} ${n + pad * 2}`);
+  svgEl.setAttribute('shape-rendering', 'crispEdges');
+  svgEl.setAttribute('role', 'img');
+  svgEl.setAttribute('aria-label', 'QR-код с ключом подключения');
+  const bg = document.createElementNS(NS, 'rect');
+  bg.setAttribute('width', '100%');
+  bg.setAttribute('height', '100%');
+  bg.setAttribute('fill', '#fff');
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', d);
+  path.setAttribute('fill', '#000');
+  svgEl.append(bg, path);
+  return svgEl;
+}
+
+function formatWhen(ms) {
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  return L.toISODate(d) === L.todayISO() ? `в ${time}` : `${d.toLocaleDateString('ru-RU')} в ${time}`;
+}
+
+function syncStatusText() {
+  if (sync.status === 'syncing') return '⏳ Синхронизация…';
+  if (sync.status === 'error') return `⚠️ ${sync.error}`;
+  if (sync.dirty && !navigator.onLine) return '📴 Нет интернета — изменения отправятся позже';
+  if (sync.lastAt) return `✅ Синхронизировано ${formatWhen(sync.lastAt)}`;
+  return '⏳ Ждёт первой синхронизации';
+}
+
+function openSyncSetup(prefillRepo) {
+  const user = location.hostname.endsWith('.github.io') ? location.hostname.split('.')[0] : '';
+  const plain = { autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' };
+  const key = h('input', { class: 'input mono', placeholder: 'treker1|…', 'aria-label': 'Ключ подключения', ...plain });
+  const repo = h('input', { class: 'input', placeholder: 'владелец/репозиторий', value: prefillRepo ?? (user ? `${user}/treker-data` : ''), ...plain });
+  const token = h('input', { class: 'input mono', type: 'password', placeholder: 'github_pat_…', ...plain });
+  const msg = h('p', { class: 'form-error', role: 'alert' });
+  const say = (text, kind = 'error') => {
+    msg.className = kind === 'error' ? 'form-error' : 'form-note';
+    msg.textContent = text;
+    msg.scrollIntoView({ block: 'nearest' });
+  };
+  const scanBox = h('div', { class: 'scanner', hidden: true });
+  const ext = (href, text) => h('a', { class: 'chip', href, target: '_blank', rel: 'noopener' }, text);
+  let form;
+
+  openSheet({
+    title: 'Синхронизация',
+    body: [
+      h('p', { class: 'hint' }, 'Данные будут лежать в твоём приватном репозитории на GitHub. Каждое устройство само забирает оттуда чужие изменения и отправляет свои. Работает и без интернета — догонит, когда связь появится.'),
+      field('Уже настроено на другом устройстве? Отсканируй или вставь ключ',
+        key,
+        h('div', { class: 'banner-actions' },
+          h('button', {
+            type: 'button',
+            class: 'chip',
+            onclick: async () => {
+              say('');
+              try {
+                const text = await scanQR(scanBox);
+                if (!text) return;
+                key.value = text;
+                if (L.parseSyncKey(text)) form.requestSubmit();
+                else say('Это не ключ подключения трекера.');
+              } catch (err) {
+                say(err.message);
+              }
+            },
+          }, '📷 Сканировать QR'),
+          navigator.clipboard?.readText && h('button', {
+            type: 'button',
+            class: 'chip',
+            onclick: async () => {
+              try {
+                key.value = (await navigator.clipboard.readText()).trim();
+              } catch {
+                key.focus();
+              }
+            },
+          }, '📋 Вставить'))),
+      scanBox,
+      h('div', { class: 'divider' }, 'или настрой с нуля — удобнее с компьютера'),
+      h('ol', { class: 'steps' },
+        h('li', null,
+          h('p', null, 'Создай ', h('b', null, 'приватный'), ' репозиторий, например treker-data: выбери Private и поставь галочку Add a README file.'),
+          ext('https://github.com/new', 'Создать репозиторий ↗')),
+        h('li', null,
+          h('p', null, 'Создай токен (fine-grained): Repository access → Only select repositories → этот репозиторий; в разрешениях репозитория Contents → Read and write; срок — максимальный. Скопируй токен.'),
+          ext('https://github.com/settings/personal-access-tokens/new', 'Создать токен ↗')),
+        h('li', null, h('p', null, 'Вставь репозиторий и токен ниже и нажми «Готово». Уже внесённые на этом устройстве данные тоже уедут в репозиторий.'))),
+      field('Репозиторий', repo),
+      field('Токен', token),
+      msg,
+    ],
+    onSave: async () => {
+      let config;
+      if (key.value.trim()) {
+        config = L.parseSyncKey(key.value);
+        if (!config) {
+          say('Ключ не распознан — скопируй его целиком.');
+          return false;
+        }
+      } else {
+        config = { repo: L.normalizeRepo(repo.value), token: token.value.trim() };
+        if (!L.isRepo(config.repo)) {
+          say('Укажи репозиторий в виде владелец/название.');
+          return false;
+        }
+        if (!L.isToken(config.token)) {
+          say('Токен выглядит неправильно — скопируй его целиком (обычно начинается с github_pat_).');
+          return false;
+        }
+      }
+      say('⏳ Проверяю доступ и синхронизирую…', 'note');
+      try {
+        await connectSync(config);
+      } catch (err) {
+        say(err?.message ?? String(err));
+        return false;
+      }
+      render();
+      toast(sync.status === 'ok' ? 'Синхронизация включена ✅' : 'Синхронизация включена — догонит, когда появится интернет');
+      return true;
+    },
+  });
+  form = sheet.querySelector('form');
+}
+
+async function openPairSheet() {
+  const key = L.makeSyncKey(sync.config);
+  const qrBox = h('div', { class: 'qr-box' });
+  openSheet({
+    title: 'Подключить устройство',
+    body: [
+      h('ol', { class: 'steps' },
+        h('li', null, h('p', null, 'На другом устройстве открой трекер (на айфоне — с иконки на экране «Домой»).')),
+        h('li', null, h('p', null, 'Настройки → «Включить синхронизацию» → «Сканировать QR» и наведи камеру на этот код. Или скопируй ключ и вставь его там.'))),
+      qrBox,
+      h('div', { class: 'btn-stack' },
+        h('button', {
+          type: 'button',
+          class: 'btn',
+          onclick: async () => {
+            try {
+              await navigator.clipboard.writeText(key);
+              toast('Ключ скопирован');
+            } catch {
+              prompt('Скопируй ключ:', key);
+            }
+          },
+        }, '📋 Скопировать ключ')),
+      h('p', { class: 'hint' }, '⚠️ Ключ = доступ к твоим данным. Не публикуй его. Если он утёк — удали токен на GitHub (Settings → Developer settings → Personal access tokens) и создай новый.'),
+    ],
+    onSave: () => true,
+  });
+  try {
+    qrBox.append(await qrSvg(key));
+  } catch {
+    qrBox.append(h('p', { class: 'hint' }, 'Не удалось нарисовать QR-код — скопируй ключ.'));
+  }
+}
+
+function syncSection() {
+  if (!sync.config) {
+    return h('div', { class: 'card pad' },
+      h('p', { class: 'hint' }, 'Одни и те же данные на телефоне и компьютере. Хранятся в твоём приватном репозитории на GitHub — бесплатно и без сервера.'),
+      h('div', { class: 'btn-stack' },
+        h('button', { type: 'button', class: 'btn primary', onclick: () => openSyncSetup() }, '☁️ Включить синхронизацию')));
+  }
+  const needsToken = ['auth', 'forbidden', 'not-found'].includes(sync.errorCode);
+  return h('div', { class: 'card pad' },
+    h('p', { class: 'sync-status' }, syncStatusText()),
+    h('p', { class: 'hint' }, 'Репозиторий: ', h('a', { href: `https://github.com/${sync.config.repo}`, target: '_blank', rel: 'noopener' }, sync.config.repo)),
+    h('div', { class: 'btn-stack' },
+      needsToken && h('button', { type: 'button', class: 'btn primary', onclick: () => openSyncSetup(sync.config.repo) }, '🔑 Ввести новый токен'),
+      h('button', { type: 'button', class: 'btn', disabled: sync.status === 'syncing', onclick: () => runSync() }, '🔄 Синхронизировать сейчас'),
+      h('button', { type: 'button', class: 'btn', onclick: openPairSheet }, '📲 Подключить другое устройство'),
+      h('button', {
+        type: 'button',
+        class: 'btn subtle',
+        onclick: async () => {
+          if (!confirm('Отключить синхронизацию на этом устройстве? Данные и здесь, и в GitHub останутся.')) return;
+          await disconnectSync();
+          render();
+          toast('Синхронизация отключена');
+        },
+      }, 'Отключить на этом устройстве')));
 }
 
 // ---------- Экран «Операции» ----------
@@ -570,7 +1044,7 @@ function backupCard() {
   const now = Date.now();
   const stale = !state.lastBackup || now - state.lastBackup > BACKUP_EVERY_MS;
   const snoozed = state.backupSnooze && now - state.backupSnooze < SNOOZE_MS;
-  if (state.transactions.length < 10 || !stale || snoozed) return null;
+  if (sync.config || state.transactions.length < 10 || !stale || snoozed) return null;
   return h('section', { class: 'card banner' },
     h('strong', null, '💾 Пора сделать резервную копию'),
     h('p', { class: 'hint' }, state.lastBackup
@@ -801,6 +1275,9 @@ function renderSettings() {
   mount($('#view-settings'),
     installCard({ dismissible: false }),
 
+    h('h2', { class: 'section-head' }, 'Синхронизация'),
+    syncSection(),
+
     h('h2', { class: 'section-head' }, 'Категории'),
     segmented([['expense', 'Расходы'], ['income', 'Доходы']], type, (t) => { state.catType = t; render(); }, 'Тип категорий'),
     h('div', { class: 'card list gap-top' },
@@ -815,7 +1292,9 @@ function renderSettings() {
     h('h2', { class: 'section-head' }, 'Данные'),
     h('div', { class: 'card pad' },
       h('p', { class: 'hint' },
-        `Всё хранится только на этом устройстве: ${count} ${L.plural(count, TX_FORMS)}. `,
+        sync.config
+          ? `На этом устройстве и в GitHub: ${count} ${L.plural(count, TX_FORMS)}. `
+          : `Всё хранится только на этом устройстве: ${count} ${L.plural(count, TX_FORMS)}. `,
         state.lastBackup ? `Последняя копия: ${new Date(state.lastBackup).toLocaleDateString('ru-RU')}.` : 'Резервных копий ещё не было.',
         persisted),
       h('div', { class: 'btn-stack' },
@@ -845,7 +1324,10 @@ function render() {
   $('#title').textContent = TITLES[tab];
   $('#monthSwitch').hidden = !(tab === 'list' || tab === 'stats');
   const monthLabel = $('#monthLabel');
-  monthLabel.textContent = L.monthTitle(state.month);
+  const [y, m] = state.month.split('-').map(Number);
+  mount(monthLabel,
+    h('span', { class: 'm-long' }, L.monthTitle(state.month)),
+    h('span', { class: 'm-short' }, `${L.MONTHS_SHORT[m - 1]} ${y}`));
   monthLabel.classList.toggle('not-current', state.month !== L.monthKey(L.todayISO()));
   $('#addBtn').hidden = tab === 'settings';
   VIEWS[tab]();
@@ -872,14 +1354,21 @@ function bindStatic() {
   $('#addBtn').addEventListener('click', () => (state.tab === 'recurring' ? openRuleSheet() : openTxSheet()));
 
   // Вернулись в приложение (например, на следующий день) — дописываем платежи
+  // и забираем изменения с других устройств; уходим — отправляем несохранённое
   document.addEventListener('visibilitychange', async () => {
-    if (document.visibilityState !== 'visible') return;
+    if (document.visibilityState !== 'visible') {
+      if (sync.dirty) runSync();
+      return;
+    }
     const added = await applyRecurring();
     if (added) {
       render();
       toast(`Записаны регулярные платежи: ${added}`);
     }
+    runSync();
   });
+  window.addEventListener('online', () => runSync());
+  setInterval(() => document.visibilityState === 'visible' && runSync(), 60_000);
 
   let resizeTimer;
   window.addEventListener('resize', () => {
@@ -911,21 +1400,25 @@ async function requestPersistentStorage() {
 async function init() {
   bindStatic();
   try {
-    const [transactions, categories, recurring, lastBackup, backupSnooze] = await Promise.all([
-      db.getAll('transactions'),
-      db.getAll('categories'),
-      db.getAll('recurring'),
+    const [lastBackup, backupSnooze, syncConfig, syncState] = await Promise.all([
       db.getMeta('lastBackup'),
       db.getMeta('backupSnooze'),
+      db.getMeta('syncConfig'),
+      db.getMeta('syncState'),
     ]);
-    Object.assign(state, { transactions, categories, recurring, lastBackup: lastBackup ?? null, backupSnooze: backupSnooze ?? null });
-    if (!categories.length) {
+    await loadState();
+    Object.assign(state, { lastBackup: lastBackup ?? null, backupSnooze: backupSnooze ?? null });
+    // При запуске читаем файл целиком (etag сброшен), дальше — условными запросами
+    if (syncConfig) Object.assign(sync, syncState ?? {}, { config: syncConfig, etag: null, status: 'ok' });
+    if (!state.categories.length) {
       state.categories = L.defaultCategories();
       await db.bulk(state.categories.map((c) => ({ store: 'categories', put: c })));
     }
     const added = await applyRecurring();
     render();
+    updateSyncBadge();
     if (added) toast(`Записаны регулярные платежи: ${added}`);
+    runSync();
   } catch (err) {
     console.error(err);
     mount($('#view-list'), h('div', { class: 'card banner' },
