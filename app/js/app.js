@@ -2,6 +2,7 @@ import { db } from './db.js';
 import * as L from './logic.js';
 import { columnChart } from './charts.js';
 import { createGitHubClient, syncOnce } from './sync.js';
+import * as Lock from './lock.js';
 
 // При деплое метка заменяется на короткий хэш коммита (см. .github/workflows/pages.yml).
 // Сравнивать с самой меткой нельзя — sed заменит и её, поэтому проверяем префикс.
@@ -613,6 +614,7 @@ async function clearAll() {
   }
   await disconnectSync();
   await db.clearAll();
+  if (lock.record) await db.setMeta('lock', lock.record); // PIN — настройка устройства, не данные
   Object.assign(state, {
     transactions: [],
     recurring: [],
@@ -1028,6 +1030,324 @@ function syncSection() {
       }, 'Отключить на этом устройстве')));
 }
 
+// ---------- Блокировка PIN-кодом ----------
+// PIN и Face ID — настройки конкретного устройства, в синхронизацию не попадают.
+
+const AUTOLOCK_OPTIONS = [[0, 'Сразу'], [60_000, '1 мин'], [300_000, '5 мин'], [900_000, '15 мин']];
+const IDLE_LOCK_MS = 5 * 60_000; // бездействие при открытом приложении (актуально для компа)
+
+const lock = {
+  record: null, // { salt, hash, iterations, autoLockMs, credentialId }
+  locked: false,
+  pin: '',
+  checking: false,
+  failures: 0,
+  lockedUntil: 0,
+  hiddenAt: null,
+  lastActivity: Date.now(),
+  bioAvailable: false,
+  message: '',
+  shake: false,
+  timer: null,
+};
+const lockEl = $('#lock');
+const bioName = Lock.biometricName();
+const canUseBio = () => Boolean(lock.record?.credentialId) && lock.bioAvailable;
+
+async function saveLockRecord(record) {
+  lock.record = record;
+  await db.setMeta('lock', record);
+}
+
+function saveAttempts() {
+  return db.setMeta('lockAttempts', { failures: lock.failures, lockedUntil: lock.lockedUntil }).catch(() => {});
+}
+
+function showLock() {
+  if (!lock.record) return;
+  lock.locked = true;
+  lock.pin = '';
+  lock.message = '';
+  renderLock();
+  if (!lockEl.open) lockEl.showModal();
+}
+
+function unlock() {
+  lock.locked = false;
+  lock.pin = '';
+  lock.lastActivity = Date.now();
+  clearTimeout(lock.timer);
+  if (lockEl.open) lockEl.close();
+  lockEl.replaceChildren();
+}
+
+function renderLock() {
+  clearTimeout(lock.timer);
+  const wait = lock.lockedUntil - Date.now();
+  if (wait > 0) lock.timer = setTimeout(renderLock, Math.min(wait, 1000));
+  const blocked = wait > 0 || lock.checking;
+  const key = (d) => h('button', { type: 'button', class: 'pin-key', 'data-key': d, disabled: blocked, onclick: () => pressDigit(d) }, d);
+  const focusedKey = lockEl.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+  const faceIcon = svgIcon('M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2M9 9v1.5M15 9v1.5M12 9v4h-1M9 16c1.7 1.3 4.3 1.3 6 0');
+  // autofocus на контейнере: иначе браузер ставит фокус (и обводку) на кнопку «1»
+  mount(lockEl, h('div', { class: 'lock-screen', tabindex: '-1', autofocus: true },
+    h('img', { class: 'lock-logo', src: 'icons/icon.svg', alt: '' }),
+    h('h2', { id: 'lockTitle' }, 'Введи PIN-код'),
+    h('div', { class: `pin-dots${lock.shake ? ' shake' : ''}`, 'aria-label': `Введено цифр: ${lock.pin.length} из ${Lock.PIN_LENGTH}` },
+      Array.from({ length: Lock.PIN_LENGTH }, (_, i) => h('span', { class: i < lock.pin.length ? 'on' : '' }))),
+    h('p', { class: 'lock-msg', role: 'alert' }, wait > 0 ? `Слишком много попыток. Подожди ${Lock.formatWait(wait)}` : lock.message),
+    h('div', { class: 'pin-pad' },
+      ['1', '2', '3', '4', '5', '6', '7', '8', '9'].map(key),
+      canUseBio()
+        ? h('button', { type: 'button', class: 'pin-key fn', 'aria-label': `Войти по ${bioName}`, onclick: unlockWithBiometric }, faceIcon)
+        : h('span'),
+      key('0'),
+      h('button', { type: 'button', class: 'pin-key fn', 'data-key': 'back', 'aria-label': 'Стереть цифру', disabled: blocked, onclick: backspace }, '⌫')),
+    canUseBio() && h('button', { type: 'button', class: 'btn primary lock-bio', onclick: unlockWithBiometric }, `Войти по ${bioName}`),
+    h('button', { type: 'button', class: 'link-btn lock-forgot', onclick: forgotPin }, 'Забыли PIN?')));
+  lock.shake = false;
+  // Перерисовка не должна сбивать фокус тем, кто вводит с клавиатуры
+  if (focusedKey) lockEl.querySelector(`[data-key="${focusedKey}"]`)?.focus();
+}
+
+function svgIcon(d) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = document.createElementNS(NS, 'svg');
+  el.setAttribute('viewBox', '0 0 24 24');
+  el.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', d);
+  el.append(path);
+  return el;
+}
+
+function pressDigit(d) {
+  if (lock.checking || lock.lockedUntil > Date.now() || lock.pin.length >= Lock.PIN_LENGTH) return;
+  lock.pin += d;
+  lock.message = '';
+  renderLock();
+  if (lock.pin.length === Lock.PIN_LENGTH) submitPin();
+}
+
+function backspace() {
+  lock.pin = lock.pin.slice(0, -1);
+  renderLock();
+}
+
+async function submitPin() {
+  lock.checking = true;
+  renderLock();
+  const ok = await Lock.checkPin(lock.pin, lock.record);
+  lock.checking = false;
+  lock.pin = '';
+  if (ok) {
+    lock.failures = 0;
+    lock.lockedUntil = 0;
+    saveAttempts();
+    unlock();
+    return;
+  }
+  lock.failures += 1;
+  lock.lockedUntil = Date.now() + Lock.lockoutMs(lock.failures);
+  await saveAttempts();
+  lock.message = 'Неверный PIN';
+  lock.shake = true;
+  renderLock();
+}
+
+async function unlockWithBiometric() {
+  try {
+    if (await Lock.verifyBiometric(lock.record.credentialId)) {
+      unlock();
+      return;
+    }
+    lock.message = `${bioName} не подтвердил — введи PIN`;
+  } catch {
+    lock.message = `${bioName} не сработал — введи PIN`;
+  }
+  renderLock();
+}
+
+// Забытый PIN не обойти: только стереть данные этого устройства.
+// Иначе «сброс» открывал бы данные любому, кто взял телефон.
+async function forgotPin() {
+  const text = sync.config
+    ? 'Сбросить PIN? Все данные на ЭТОМ устройстве удалятся, синхронизация на нём отключится. В GitHub данные останутся: подключи устройство заново ключом с другого устройства — и они вернутся.'
+    : 'Сбросить PIN? ВСЕ данные на этом устройстве удалятся безвозвратно. Вернуть их можно только из файла резервной копии.';
+  if (!confirm(text)) return;
+  if (!confirm('Точно? Это нельзя отменить.')) return;
+  await disconnectSync();
+  await db.clearAll();
+  location.reload();
+}
+
+// Нельзя закрыть Escape'ом; если браузер всё же закрыл окно — открываем снова
+lockEl.addEventListener('cancel', (e) => e.preventDefault());
+lockEl.addEventListener('close', () => {
+  if (lock.locked) lockEl.showModal();
+});
+// Слушаем весь документ: после перерисовки фокус может оказаться на body.
+// Отменённый keydown Escape не даёт браузеру закрыть окно блокировки.
+document.addEventListener('keydown', (e) => {
+  if (!lock.locked) return;
+  if (/^\d$/.test(e.key)) pressDigit(e.key);
+  else if (e.key === 'Backspace') backspace();
+  else if (e.key !== 'Escape') return;
+  e.preventDefault();
+});
+
+function bindLock() {
+  const touch = () => { lock.lastActivity = Date.now(); };
+  document.addEventListener('pointerdown', touch, { capture: true, passive: true });
+  document.addEventListener('keydown', touch, { capture: true, passive: true });
+  // Свернули — прячем содержимое (чтобы суммы не попали в превью переключателя приложений),
+  // вернулись позже порога — блокируем
+  document.addEventListener('visibilitychange', () => {
+    if (!lock.record) return;
+    if (document.visibilityState === 'hidden') {
+      lock.hiddenAt = Date.now();
+      document.documentElement.classList.add('privacy');
+      return;
+    }
+    if (!lock.locked && lock.hiddenAt !== null && Date.now() - lock.hiddenAt >= (lock.record.autoLockMs ?? 60_000)) showLock();
+    lock.hiddenAt = null;
+    document.documentElement.classList.remove('privacy');
+  });
+  setInterval(() => {
+    const idle = Math.max(lock.record?.autoLockMs ?? 0, IDLE_LOCK_MS);
+    if (lock.record && !lock.locked && document.visibilityState === 'visible' && Date.now() - lock.lastActivity > idle) showLock();
+  }, 15_000);
+}
+
+function pinInput(label) {
+  return h('input', {
+    class: 'input pin-input',
+    type: 'password',
+    inputmode: 'numeric',
+    pattern: '[0-9]*',
+    maxlength: Lock.PIN_LENGTH,
+    autocomplete: 'off',
+    'aria-label': label,
+  });
+}
+
+// mode: 'set' — первый PIN, 'change' — сменить, 'off' — выключить
+function openPinSheet(mode) {
+  const current = mode !== 'set' ? pinInput('Текущий PIN') : null;
+  const next = mode !== 'off' ? pinInput('Новый PIN') : null;
+  const repeat = mode !== 'off' ? pinInput('Повтори новый PIN') : null;
+  const err = h('p', { class: 'form-error', role: 'alert' });
+  const titles = { set: 'PIN-код на вход', change: 'Сменить PIN-код', off: 'Выключить PIN-код' };
+
+  openSheet({
+    title: titles[mode],
+    body: [
+      mode === 'set' && h('p', { class: 'hint' }, `Приложение спросит PIN при открытии и после сворачивания. PIN — ${Lock.PIN_LENGTH} цифры, у каждого устройства свой. Не используй PIN от банковской карты.`),
+      current && field('Текущий PIN', current),
+      next && field(`Новый PIN (${Lock.PIN_LENGTH} цифры)`, next),
+      repeat && field('Повтори новый PIN', repeat),
+      err,
+      mode === 'set' && h('p', { class: 'hint' }, 'Если забудешь PIN, придётся стереть данные этого устройства. С синхронизацией они вернутся из GitHub, без неё — только из файла резервной копии.'),
+    ],
+    onSave: async () => {
+      err.textContent = '';
+      if (current) {
+        const wait = lock.lockedUntil - Date.now();
+        if (wait > 0) {
+          err.textContent = `Слишком много попыток. Подожди ${Lock.formatWait(wait)}`;
+          return false;
+        }
+        if (!(await Lock.checkPin(current.value, lock.record))) {
+          lock.failures += 1;
+          lock.lockedUntil = Date.now() + Lock.lockoutMs(lock.failures);
+          saveAttempts();
+          err.textContent = 'Текущий PIN неверный';
+          current.value = '';
+          current.focus();
+          return false;
+        }
+        lock.failures = 0;
+        lock.lockedUntil = 0;
+        saveAttempts();
+      }
+      if (mode === 'off') {
+        await saveLockRecord(null);
+        render();
+        toast('PIN-код выключен');
+        return true;
+      }
+      if (!Lock.isValidPin(next.value)) {
+        err.textContent = `Нужно ровно ${Lock.PIN_LENGTH} цифры`;
+        next.focus();
+        return false;
+      }
+      if (Lock.isWeakPin(next.value)) {
+        err.textContent = 'Слишком простой PIN — такие угадывают с первой попытки';
+        next.value = '';
+        repeat.value = '';
+        next.focus();
+        return false;
+      }
+      if (next.value !== repeat.value) {
+        err.textContent = 'PIN-коды не совпадают';
+        repeat.value = '';
+        repeat.focus();
+        return false;
+      }
+      const pinRecord = await Lock.createPinRecord(next.value);
+      await saveLockRecord({ autoLockMs: 60_000, credentialId: null, ...lock.record, ...pinRecord });
+      render();
+      toast(mode === 'set' && lock.bioAvailable ? `PIN-код установлен. Ниже можно включить вход по ${bioName}` : 'PIN-код сохранён');
+      return true;
+    },
+  });
+  (current ?? next).focus();
+}
+
+async function toggleBiometric(input) {
+  if (!input.checked) {
+    await saveLockRecord({ ...lock.record, credentialId: null });
+    toast(`Вход по ${bioName} выключен`);
+    return;
+  }
+  try {
+    const credentialId = await Lock.registerBiometric(); // без await до вызова — Safari нужен жест
+    await saveLockRecord({ ...lock.record, credentialId });
+    toast(`Вход по ${bioName} включён`);
+  } catch (err) {
+    console.warn(err);
+    input.checked = false;
+    toast(`Не получилось включить ${bioName}`);
+  }
+}
+
+function securitySection() {
+  if (!lock.record) {
+    return h('div', { class: 'card pad' },
+      h('p', { class: 'hint' }, `PIN-код на вход${lock.bioAvailable ? ` и ${bioName}` : ''}: приложение спросит его при открытии и после сворачивания.`),
+      h('div', { class: 'btn-stack' },
+        h('button', { type: 'button', class: 'btn primary', onclick: () => openPinSheet('set') }, '🔒 Поставить PIN-код')));
+  }
+  const bioSwitch = lock.bioAvailable && h('input', {
+    type: 'checkbox',
+    class: 'switch',
+    checked: Boolean(lock.record.credentialId),
+    'aria-label': `Входить по ${bioName}`,
+    onchange: (e) => toggleBiometric(e.target),
+  });
+  return h('div', { class: 'card pad' },
+    h('p', { class: 'sync-status' }, '🔒 Вход по PIN-коду включён'),
+    bioSwitch && h('label', { class: 'toggle-row inset' }, h('span', null, `Входить по ${bioName}`), bioSwitch),
+    field('Блокировать после сворачивания',
+      segmented(AUTOLOCK_OPTIONS, lock.record.autoLockMs ?? 60_000, async (ms) => {
+        await saveLockRecord({ ...lock.record, autoLockMs: ms });
+      }, 'Когда блокировать')),
+    h('div', { class: 'btn-stack' },
+      h('button', { type: 'button', class: 'btn', onclick: showLock }, '🔐 Заблокировать сейчас'),
+      h('button', { type: 'button', class: 'btn', onclick: () => openPinSheet('change') }, 'Сменить PIN-код'),
+      h('button', { type: 'button', class: 'btn subtle', onclick: () => openPinSheet('off') }, 'Выключить PIN-код')));
+}
+
 // ---------- Экран «Операции» ----------
 
 function installCard({ dismissible }) {
@@ -1275,6 +1595,9 @@ function renderSettings() {
   mount($('#view-settings'),
     installCard({ dismissible: false }),
 
+    h('h2', { class: 'section-head' }, 'Защита'),
+    securitySection(),
+
     h('h2', { class: 'section-head' }, 'Синхронизация'),
     syncSection(),
 
@@ -1399,7 +1722,20 @@ async function requestPersistentStorage() {
 
 async function init() {
   bindStatic();
+  bindLock();
   try {
+    // Сначала блокировка — чтобы данные не мелькнули до экрана PIN
+    const [lockRecord, attempts] = await Promise.all([db.getMeta('lock'), db.getMeta('lockAttempts')]);
+    if (lockRecord) {
+      lock.record = lockRecord;
+      Object.assign(lock, { failures: attempts?.failures ?? 0, lockedUntil: attempts?.lockedUntil ?? 0 });
+      showLock();
+    }
+    Lock.biometricAvailable().then((ok) => {
+      lock.bioAvailable = ok;
+      if (lock.locked) renderLock();
+      else if (state.tab === 'settings' && !sheet.open) renderSettings();
+    });
     const [lastBackup, backupSnooze, syncConfig, syncState] = await Promise.all([
       db.getMeta('lastBackup'),
       db.getMeta('backupSnooze'),
