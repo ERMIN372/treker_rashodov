@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f2f2ef" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Расходы">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="description" content="Личный трекер расходов и доходов. Данные хранятся только на устройстве.">
+  <title>Расходы</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1 id="title">Операции</h1>
+    <div class="month-switch" id="monthSwitch">
+      <button type="button" class="icon-btn" data-month="-1" aria-label="Предыдущий месяц">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <button type="button" class="month-label" id="monthLabel" title="К текущему месяцу"></button>
+      <button type="button" class="icon-btn" data-month="1" aria-label="Следующий месяц">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section id="view-list" class="view" aria-label="Операции"></section>
+    <section id="view-stats" class="view" aria-label="Статистика" hidden></section>
+    <section id="view-recurring" class="view" aria-label="Регулярные платежи" hidden></section>
+    <section id="view-settings" class="view" aria-label="Настройки" hidden></section>
+  </main>
+
+  <button type="button" class="fab" id="addBtn" aria-label="Добавить">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+
+  <nav class="tabbar" aria-label="Разделы">
+    <button type="button" class="tab" data-tab="list">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></svg>
+      <span>Операции</span>
+    </button>
+    <button type="button" class="tab" data-tab="stats">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M6.5 16.5v-5M11.5 16.5V5M16.5 16.5v-8"/></svg>
+      <span>Статистика</span>
+    </button>
+    <button type="button" class="tab" data-tab="recurring">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 2l3 3-3 3"/><path d="M4 11V9a4 4 0 0 1 4-4h12"/><path d="M7 22l-3-3 3-3"/><path d="M20 13v2a4 4 0 0 1-4 4H4"/></svg>
+      <span>Регулярные</span>
+    </button>
+    <button type="button" class="tab" data-tab="settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+      <span>Настройки</span>
+    </button>
+  </nav>
+
+  <dialog id="sheet" class="sheet" aria-labelledby="sheetTitle"></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <noscript>Для работы приложения нужен JavaScript.</noscript>
+</body>
+</html>
