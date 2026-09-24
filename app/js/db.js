@@ -55,6 +55,30 @@ export const db = {
     });
   },
 
+  // Версии с другого устройства: каждая сверяется с текущей внутри транзакции,
+  // чтобы не затереть правку, сделанную прямо во время синхронизации.
+  // merge(store, current, incoming) → что записать или null. Возвращает число записей.
+  mergeIn(changes, merge) {
+    const stores = Object.keys(changes);
+    if (!stores.length) return Promise.resolve(0);
+    let applied = 0;
+    return run(stores, 'readwrite', (t) => {
+      for (const name of stores) {
+        const s = t.objectStore(name);
+        for (const rec of changes[name]) {
+          const req = s.get(rec.id);
+          req.onsuccess = () => {
+            const next = merge(name, req.result, rec);
+            if (next) {
+              s.put(next);
+              applied += 1;
+            }
+          };
+        }
+      }
+    }).then(() => applied);
+  },
+
   // Полная замена данных (восстановление из копии) — одной транзакцией
   replaceAll(data) {
     return run(DATA_STORES, 'readwrite', (t) => {

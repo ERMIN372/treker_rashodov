@@ -287,6 +287,16 @@ export function makeBackup({ transactions, categories, recurring }, now = new Da
   return { format: BACKUP_FORMAT, version: 1, exportedAt: now.toISOString(), transactions, categories, recurring };
 }
 
+// Проверки записей — общие для резервной копии и файла синхронизации
+const isAmount = (a) => Number.isInteger(a) && a > 0 && a <= MAX_AMOUNT;
+const isId = (s) => typeof s === 'string' && s.length > 0;
+const VALIDATORS = {
+  transactions: (t) => isId(t?.id) && TYPES.has(t.type) && isAmount(t.amount) && isISODate(t.date) && isId(t.categoryId),
+  categories: (c) => isId(c?.id) && typeof c.name === 'string' && TYPES.has(c.type),
+  recurring: (r) => isId(r?.id) && TYPES.has(r.type) && isAmount(r.amount) && isISODate(r.startDate) && PERIODS.has(r.period) && isId(r.categoryId),
+};
+const RECORD_NAMES = { transactions: 'операция', categories: 'категория', recurring: 'регулярный платёж' };
+
 export function parseBackup(text) {
   let data;
   try {
@@ -297,21 +307,121 @@ export function parseBackup(text) {
   if (data?.format !== BACKUP_FORMAT) throw new Error('Это не резервная копия трекера расходов.');
   if (data.version > 1) throw new Error('Копия сделана более новой версией приложения — обнови страницу.');
   const { transactions, categories, recurring = [] } = data;
-  if (![transactions, categories, recurring].every(Array.isArray)) throw new Error('Копия повреждена.');
-
-  const bad = (what, i) => new Error(`Копия повреждена: ${what} №${i + 1}.`);
-  const isAmount = (a) => Number.isInteger(a) && a > 0 && a <= MAX_AMOUNT;
-  const isId = (s) => typeof s === 'string' && s.length > 0;
-  categories.forEach((c, i) => {
-    if (!isId(c?.id) || typeof c.name !== 'string' || !TYPES.has(c.type)) throw bad('категория', i);
-  });
-  transactions.forEach((t, i) => {
-    if (!isId(t?.id) || !TYPES.has(t.type) || !isAmount(t.amount) || !isISODate(t.date) || !isId(t.categoryId)) throw bad('операция', i);
-  });
-  recurring.forEach((r, i) => {
-    if (!isId(r?.id) || !TYPES.has(r.type) || !isAmount(r.amount) || !isISODate(r.startDate) || !PERIODS.has(r.period) || !isId(r.categoryId)) {
-      throw bad('регулярный платёж', i);
-    }
-  });
+  const lists = { transactions, categories, recurring };
+  if (!Object.values(lists).every(Array.isArray)) throw new Error('Копия повреждена.');
+  for (const name of ['categories', 'transactions', 'recurring']) {
+    const i = lists[name].findIndex((r) => !VALIDATORS[name](r));
+    if (i >= 0) throw new Error(`Копия повреждена: ${RECORD_NAMES[name]} №${i + 1}.`);
+  }
   return { transactions, categories, recurring };
+}
+
+// ---------- Синхронизация: слияние записей ----------
+// У каждой записи есть updatedAt (мс). Удаление хранится «надгробием»
+// { id, deleted: true, updatedAt }, иначе удалённое на одном устройстве
+// вернулось бы с другого. При конфликте побеждает более свежая версия.
+
+export const SYNC_STORES = ['transactions', 'categories', 'recurring'];
+export const SYNC_FORMAT = 'treker-rashodov-sync';
+
+export const stampOf = (r) => r.updatedAt ?? r.createdAt ?? 0;
+export const isTombstone = (r) => isId(r?.id) && r.deleted === true && Number.isFinite(r.updatedAt);
+
+// Ключ для сравнения записей без учёта порядка полей и undefined
+export function recordKey(r) {
+  return JSON.stringify(Object.keys(r).filter((k) => r[k] !== undefined).sort().map((k) => [k, r[k]]));
+}
+
+// Должна ли версия b заменить версию a
+export function isNewer(b, a) {
+  const sb = stampOf(b);
+  const sa = stampOf(a);
+  if (sb !== sa) return sb > sa;
+  if (Boolean(b.deleted) !== Boolean(a.deleted)) return Boolean(b.deleted);
+  return recordKey(b) > recordKey(a); // ничья решается одинаково на всех устройствах
+}
+
+const maxDate = (x, y) => (!x ? y ?? null : !y ? x : x > y ? x : y);
+
+// Итог слияния двух версий одной записи. У правил регулярных платежей
+// lastDate берётся максимальный, чтобы платёж не записался второй раз.
+export function resolveRecord(a, b, store) {
+  let winner = isNewer(b, a) ? b : a;
+  if (store === 'recurring' && !a.deleted && !b.deleted) {
+    const lastDate = maxDate(a.lastDate, b.lastDate);
+    if ((winner.lastDate ?? null) !== lastDate) winner = { ...winner, lastDate };
+  }
+  return winner;
+}
+
+// toLocal — что записать у себя; remoteStale — нужно ли отправить своё на сервер
+export function mergeStore(local, remote, store) {
+  const localById = new Map(local.map((r) => [r.id, r]));
+  const seen = new Set();
+  const toLocal = [];
+  let remoteStale = false;
+  for (const r of remote) {
+    seen.add(r.id);
+    const l = localById.get(r.id);
+    const merged = l ? resolveRecord(l, r, store) : r;
+    if (!l || recordKey(merged) !== recordKey(l)) toLocal.push(merged);
+    if (recordKey(merged) !== recordKey(r)) remoteStale = true;
+  }
+  if (!remoteStale) remoteStale = local.some((l) => !seen.has(l.id));
+  return { toLocal, remoteStale };
+}
+
+// По записи на строку и в стабильном порядке — история в GitHub читается как дифф
+export function serializeSync(data, now = new Date()) {
+  const order = (a, b) => ((a.date ?? '') + a.id < (b.date ?? '') + b.id ? -1 : 1);
+  const block = (name) => `"${name}": [\n${[...data[name]].sort(order).map((r) => JSON.stringify(r)).join(',\n')}\n]`;
+  return `{"format": "${SYNC_FORMAT}", "version": 1, "savedAt": "${now.toISOString()}",\n${SYNC_STORES.map(block).join(',\n')}\n}\n`;
+}
+
+export function parseSyncData(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error('Файл синхронизации в репозитории повреждён (не JSON).');
+  }
+  if (data?.format !== SYNC_FORMAT) throw new Error('В репозитории лежит посторонний файл rashody.json — выбери другой репозиторий.');
+  if (data.version > 1) throw new Error('Данные записаны более новой версией приложения — обнови страницу.');
+  for (const name of SYNC_STORES) {
+    if (!Array.isArray(data[name])) throw new Error('Файл синхронизации повреждён.');
+    const i = data[name].findIndex((r) => !(isTombstone(r) || VALIDATORS[name](r)));
+    if (i >= 0) throw new Error(`Файл синхронизации повреждён: ${RECORD_NAMES[name]} №${i + 1}.`);
+  }
+  return data;
+}
+
+// Ключ подключения устройства: репозиторий + токен одной строкой (для QR и копирования)
+const KEY_PREFIX = 'treker1';
+export const isRepo = (s) => typeof s === 'string' && /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(s);
+export const isToken = (s) => typeof s === 'string' && /^[A-Za-z0-9_]{20,255}$/.test(s);
+
+export function normalizeRepo(input) {
+  return String(input ?? '').trim()
+    .replace(/^(https?:\/\/)?(www\.)?github\.com\//i, '')
+    .replace(/\/+$/, '')
+    .replace(/\.git$/i, '');
+}
+
+export const makeSyncKey = ({ repo, token }) => `${KEY_PREFIX}|${repo}|${token}`;
+
+export function parseSyncKey(input) {
+  const parts = String(input ?? '').trim().split('|');
+  if (parts.length !== 3 || parts[0] !== KEY_PREFIX) return null;
+  const [, repo, token] = parts;
+  return isRepo(repo) && isToken(token) ? { repo, token } : null;
+}
+
+export function deviceName(ua = '') {
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/iPad/.test(ua)) return 'iPad';
+  if (/Android/.test(ua)) return 'Android';
+  if (/Mac OS X|Macintosh/.test(ua)) return 'Mac';
+  if (/Windows/.test(ua)) return 'Windows';
+  if (/Linux/.test(ua)) return 'Linux';
+  return 'устройство';
 }

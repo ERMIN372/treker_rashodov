@@ -99,7 +99,7 @@ h1, h2, p { margin: 0; }
   background: var(--bg);
 }
 
-.topbar h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
+.topbar h1 { font-size: 21px; font-weight: 700; letter-spacing: -0.01em; }
 
 .month-switch {
   display: flex;
@@ -112,7 +112,7 @@ h1, h2, p { margin: 0; }
 .icon-btn {
   display: grid;
   place-items: center;
-  width: 40px;
+  width: 36px;
   height: 40px;
   color: var(--accent);
 }
@@ -128,10 +128,19 @@ h1, h2, p { margin: 0; }
 }
 
 .month-label {
-  min-width: 108px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
   text-align: center;
+  white-space: nowrap;
+}
+
+.m-short { display: none; }
+
+/* iPhone SE и другие узкие экраны: короткий месяц, чтобы шапка была в одну строку */
+@media (max-width: 359px) {
+  .topbar h1 { font-size: 19px; }
+  .m-long { display: none; }
+  .m-short { display: inline; }
 }
 
 .month-label.not-current { color: var(--accent); }
@@ -759,3 +768,89 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 }
 
 .toast button { flex: none; color: #86b6ef; font-weight: 600; }
+
+/* ---------- Синхронизация ---------- */
+
+.tab { position: relative; }
+
+.sync-dot {
+  position: absolute;
+  top: 3px;
+  left: calc(50% + 10px);
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  box-sizing: content-box;
+}
+
+.sync-dot.is-syncing { background: var(--accent); animation: sync-pulse 0.8s ease-in-out infinite alternate; }
+
+.sync-dot.is-error { background: var(--neg); }
+
+@keyframes sync-pulse {
+  from { opacity: 1; }
+  to { opacity: 0.3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-dot.is-syncing { animation: none; }
+}
+
+.sync-status { font-weight: 600; margin-bottom: 4px; overflow-wrap: anywhere; }
+
+.form-note { color: var(--ink-2); font-size: 14px; text-align: center; }
+
+.form-note:empty { display: none; }
+
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 15px; }
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink-2);
+  font-size: 13px;
+  text-align: center;
+}
+
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--hairline); }
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding-left: 22px;
+  font-size: 15px;
+}
+
+.steps li::marker { color: var(--ink-2); font-weight: 600; }
+
+.steps li p { margin-bottom: 6px; }
+
+.steps .chip { display: inline-block; color: var(--accent); text-decoration: none; }
+
+.qr-box {
+  width: min(100%, 300px);
+  margin: 0 auto;
+  padding: 10px;
+  border-radius: 16px;
+  background: #fff; /* QR читается только тёмным по светлому — и в тёмной теме тоже */
+}
+
+.qr-box svg { display: block; width: 100%; height: auto; }
+
+.scanner { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+
+.scanner video {
+  width: 100%;
+  max-height: 55vh;
+  border-radius: 16px;
+  background: #000;
+  object-fit: cover;
+}
+
+.btn.subtle { background: transparent; color: var(--ink-2); font-weight: 500; }
+
+.card.pad a { color: var(--accent); }
