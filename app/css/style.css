@@ -854,3 +854,111 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 .btn.subtle { background: transparent; color: var(--ink-2); font-weight: 500; }
 
 .card.pad a { color: var(--accent); }
+
+/* ---------- Экран блокировки ---------- */
+
+.lock {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+  border: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.lock::backdrop { background: var(--bg); }
+
+.lock-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  min-height: 100%;
+  padding: 24px 0;
+}
+
+.lock-logo { width: 64px; height: 64px; }
+
+.lock-screen h2 { font-size: 20px; font-weight: 600; }
+
+.pin-dots { display: flex; gap: 18px; }
+
+.pin-dots span {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--ink-2);
+  border-radius: 50%;
+}
+
+.pin-dots span.on { border-color: var(--accent); background: var(--accent); }
+
+.pin-dots.shake { animation: pin-shake 0.35s; }
+
+@keyframes pin-shake {
+  20%, 60% { transform: translateX(-10px); }
+  40%, 80% { transform: translateX(10px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pin-dots.shake { animation: none; }
+}
+
+.lock-msg { min-height: 20px; color: var(--neg); font-size: 14px; text-align: center; }
+
+.pin-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 76px);
+  gap: 14px 22px;
+}
+
+.pin-key {
+  display: grid;
+  place-items: center;
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 30px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.pin-key:active { background: var(--surface-2); }
+
+.pin-key.fn { background: transparent; box-shadow: none; color: var(--accent); font-size: 26px; }
+
+.pin-key svg {
+  width: 34px;
+  height: 34px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.lock-bio { max-width: 280px; }
+
+.lock-forgot { font-size: 15px; color: var(--ink-2); }
+
+@media (max-height: 640px) {
+  .pin-pad { grid-template-columns: repeat(3, 64px); gap: 10px 20px; }
+  .pin-key { width: 64px; height: 64px; font-size: 26px; }
+  .lock-logo { display: none; }
+}
+
+.pin-input { letter-spacing: 0.5em; font-size: 22px; text-align: center; }
+
+.toggle-row.inset { margin: 10px 0 14px; padding: 10px 0; background: transparent; }
+
+/* Приложение свёрнуто: прячем суммы, чтобы они не попали в превью переключателя приложений */
+html.privacy body > :not(#lock) { visibility: hidden; }
+
+.lock-screen:focus { outline: none; }

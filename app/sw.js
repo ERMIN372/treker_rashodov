@@ -11,6 +11,7 @@ const ASSETS = [
   './js/logic.js',
   './js/charts.js',
   './js/sync.js',
+  './js/lock.js',
   './manifest.webmanifest',
   './icons/icon.svg',
   './icons/apple-touch-icon.png',
