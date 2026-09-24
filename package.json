@@ -1,0 +1,9 @@
+{
+  "name": "treker-rashodov",
+  "private": true,
+  "description": "Личный трекер расходов — PWA без сервера, данные хранятся на устройстве",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
