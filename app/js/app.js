@@ -21,6 +21,7 @@ const state = {
   categories: [],
   recurring: [],
   debts: [],
+  presets: [],
   debtFilter: 'open',
   month: L.monthKey(L.todayISO()),
   tab: 'list',
@@ -185,7 +186,7 @@ function openSheet({ title, body, onSave }) {
       h('button', { type: 'submit', class: 'link-btn strong' }, 'Готово')),
     h('div', { class: 'sheet-body' }, body));
   sheet.replaceChildren(form);
-  sheet.showModal();
+  if (!sheet.open) sheet.showModal(); // уже открыта — просто меняем содержимое
 }
 
 function closeSheet() {
@@ -268,9 +269,9 @@ function defaultDate() {
   return L.monthKey(today) === state.month ? today : `${state.month}-01`;
 }
 
-function openTxSheet(tx = null) {
+function openTxSheet(tx = null, preset = null) {
   const today = L.todayISO();
-  const draft = { type: tx?.type ?? 'expense', categoryId: tx?.categoryId ?? null };
+  const draft = { type: tx?.type ?? preset?.type ?? 'expense', categoryId: tx?.categoryId ?? preset?.categoryId ?? null };
   const amount = amountInput(tx?.amount);
   const err = h('p', { class: 'form-error', role: 'alert' });
   const picker = categoryPicker(draft.type, draft.categoryId, (id) => {
@@ -278,7 +279,7 @@ function openTxSheet(tx = null) {
     err.textContent = '';
   });
   const date = dateInput(tx?.date ?? defaultDate());
-  const note = h('input', { class: 'input', maxlength: 120, enterkeyhint: 'done', placeholder: 'Необязательно', value: tx?.note ?? '' });
+  const note = h('input', { class: 'input', maxlength: 120, enterkeyhint: 'done', placeholder: 'Необязательно', value: tx?.note ?? preset?.note ?? '' });
   const quick = (label, iso) => h('button', { type: 'button', class: 'chip', onclick: () => { date.value = iso; } }, label);
 
   openSheet({
@@ -526,11 +527,13 @@ async function deleteCategory(cat) {
   const other = L.OTHER_CATEGORY[cat.type];
   const txs = state.transactions.filter((t) => t.categoryId === cat.id).map((t) => ({ ...t, categoryId: other }));
   const rules = state.recurring.filter((r) => r.categoryId === cat.id).map((r) => ({ ...r, categoryId: other }));
+  const presets = state.presets.filter((p) => p.categoryId === cat.id).map((p) => ({ ...p, categoryId: other }));
   const moved = txs.length ? ` ${txs.length} ${L.plural(txs.length, TX_FORMS)} перейдут в «${catById(other).name}».` : '';
   if (!confirm(`Удалить категорию «${cat.name}»?${moved}`)) return;
   await persist([
     ...txs.map((t) => ({ store: 'transactions', put: t })),
     ...rules.map((r) => ({ store: 'recurring', put: r })),
+    ...presets.map((p) => ({ store: 'presets', put: p })),
     { store: 'categories', delete: cat },
   ]);
   if (state.filterCategory === cat.id) state.filterCategory = null;
@@ -621,6 +624,7 @@ async function clearAll() {
     transactions: [],
     recurring: [],
     debts: [],
+    presets: [],
     categories: L.defaultCategories(),
     tombstones: Object.fromEntries(L.SYNC_STORES.map((s) => [s, new Set()])),
     filterCategory: null,
@@ -1374,6 +1378,227 @@ function securitySection() {
       h('button', { type: 'button', class: 'btn subtle', onclick: () => openPinSheet('off') }, 'Выключить PIN-код')));
 }
 
+// ---------- Быстрые кнопки ----------
+// Частые траты в один тап. Одна сумма — запись сразу (с «Отменить»),
+// несколько — выбор суммы. Кнопки синхронизируются, как и остальные данные.
+
+// Кнопки по умолчанию. Фиксированные id: второе устройство создаст те же
+// записи, и при синхронизации дублей не будет; время 0 — любая правка сильнее.
+async function seedPresets() {
+  if (await db.getMeta('presetsSeeded')) return;
+  const known = (store, id) => state[store].some((r) => r.id === id) || state.tombstones[store].has(id);
+  const ops = [];
+  if (!known('categories', 'exp-tobacco')) {
+    ops.push({ store: 'categories', put: { id: 'exp-tobacco', type: 'expense', name: 'Табак', emoji: '🚬', order: 50 } });
+  }
+  const transport = state.categories.some((c) => c.id === 'exp-transport') ? 'exp-transport' : L.OTHER_CATEGORY.expense;
+  const seeds = [
+    { id: 'preset-iqos', emoji: '🚬', label: 'Стики', type: 'expense', categoryId: 'exp-tobacco', amounts: [23000], note: 'Стики IQOS', order: 1 },
+    { id: 'preset-troika', emoji: '🚇', label: 'Тройка', type: 'expense', categoryId: transport, amounts: [20000, 30000, 40000, 50000], note: 'Пополнение Тройки', order: 2 },
+  ];
+  for (const p of seeds) if (!known('presets', p.id)) ops.push({ store: 'presets', put: p });
+  if (ops.length) await persist(ops, { stamp: false });
+  await db.setMeta('presetsSeeded', true);
+}
+
+const presetIcon = (p) => p.emoji || catById(p.categoryId).emoji;
+
+function quickRow() {
+  return h('div', { class: 'quick-row', role: 'group', 'aria-label': 'Быстрые кнопки' },
+    L.sortPresets(state.presets).map((p) => h('button', {
+      type: 'button',
+      class: 'quick-btn',
+      'aria-label': p.amounts.length === 1 ? `${p.label}: записать ${L.formatMoney(p.amounts[0])}` : `${p.label}: выбрать сумму`,
+      onclick: () => usePreset(p),
+    },
+      h('span', { 'aria-hidden': 'true' }, presetIcon(p)),
+      h('span', null, p.label),
+      p.amounts.length === 1 && h('span', { class: 'quick-sum' }, L.formatMoney(p.amounts[0])))),
+    h('button', { type: 'button', class: 'quick-btn add', 'aria-label': 'Новая быстрая кнопка', onclick: () => openPresetSheet() }, '＋'));
+}
+
+let quickLockAt = 0;
+async function quickAdd(p, amount) {
+  const now = Date.now();
+  if (now - quickLockAt < 800) return; // случайный двойной тап
+  quickLockAt = now;
+  const item = { id: uid(), createdAt: now, type: p.type, amount, categoryId: p.categoryId, date: L.todayISO(), note: p.note || p.label };
+  await persist([{ store: 'transactions', put: item }]);
+  state.month = L.monthKey(item.date);
+  render();
+  toast(`${presetIcon(p)} ${p.label}: ${L.formatMoney(amount)} записано`, {
+    label: 'Отменить',
+    run: async () => {
+      await persist([{ store: 'transactions', delete: item }]);
+      render();
+    },
+  });
+}
+
+function usePreset(p) {
+  if (p.amounts.length === 1) {
+    quickAdd(p, p.amounts[0]);
+    return;
+  }
+  openSheet({
+    title: `${presetIcon(p)} ${p.label}`,
+    body: [
+      h('p', { class: 'hint' }, 'Выбери сумму — операция запишется сразу.'),
+      h('div', { class: 'amount-grid' }, p.amounts.map((a) => h('button', {
+        type: 'button',
+        class: 'amount-choice',
+        onclick: () => {
+          closeSheet();
+          quickAdd(p, a);
+        },
+      }, L.formatMoney(a)))),
+      h('button', { type: 'button', class: 'btn', onclick: () => openTxSheet(null, p) }, 'Другая сумма'),
+    ],
+    onSave: () => true,
+  });
+}
+
+function openPresetSheet(preset = null) {
+  const draft = { type: preset?.type ?? 'expense', categoryId: preset?.categoryId ?? null };
+  const plain = { autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' };
+  const emoji = h('input', { class: 'input emoji-input', maxlength: 16, placeholder: '☕', 'aria-label': 'Значок', value: preset?.emoji ?? '' });
+  const label = h('input', { class: 'input', maxlength: 24, placeholder: 'Кофе', 'aria-label': 'Название', value: preset?.label ?? '' });
+  const amounts = h('input', { class: 'input', placeholder: '250  или  200, 300, 400', 'aria-label': 'Суммы', value: preset ? L.formatAmounts(preset.amounts) : '', ...plain });
+  const note = h('input', { class: 'input', maxlength: 120, placeholder: 'Необязательно — иначе название кнопки', value: preset?.note ?? '' });
+  const err = h('p', { class: 'form-error', role: 'alert' });
+  const picker = categoryPicker(draft.type, draft.categoryId, (id) => {
+    draft.categoryId = id;
+    err.textContent = '';
+  });
+
+  openSheet({
+    title: preset ? 'Быстрая кнопка' : 'Новая быстрая кнопка',
+    body: [
+      segmented([['expense', 'Расход'], ['income', 'Доход']], draft.type, (t) => {
+        draft.type = t;
+        draft.categoryId = null;
+        picker.setType(t);
+      }, 'Тип операции'),
+      field('Значок и название', h('div', { class: 'date-row' }, emoji, label)),
+      field('Сумма', amounts),
+      h('p', { class: 'hint tip' }, 'Одна сумма — запись в один тап. Несколько через запятую с пробелом (до 8) — выбор суммы при нажатии.'),
+      err,
+      field('Категория', picker.el),
+      field('Комментарий к операции', note),
+      preset && h('button', { type: 'button', class: 'danger-btn', onclick: () => deletePreset(preset) }, 'Удалить кнопку'),
+    ],
+    onSave: async () => {
+      const title = label.value.trim();
+      const list = L.parseAmounts(amounts.value);
+      if (!title) {
+        err.textContent = 'Введи название';
+        label.focus();
+        return false;
+      }
+      if (!list) {
+        err.textContent = 'Суммы не распознаны: например «230» или «200, 300, 400, 500»';
+        amounts.focus();
+        return false;
+      }
+      if (!draft.categoryId) {
+        err.textContent = 'Выбери категорию';
+        return false;
+      }
+      const maxOrder = Math.max(0, ...state.presets.map((p) => p.order ?? 0));
+      const item = {
+        ...(preset ?? { id: uid(), order: maxOrder + 1, createdAt: Date.now() }),
+        emoji: firstGrapheme(emoji.value),
+        label: title,
+        type: draft.type,
+        categoryId: draft.categoryId,
+        amounts: list,
+        note: note.value.trim(),
+      };
+      await persist([{ store: 'presets', put: item }]);
+      render();
+      toast(preset ? 'Кнопка сохранена' : 'Кнопка добавлена на «Операции»');
+      return true;
+    },
+  });
+  if (!preset) label.focus();
+}
+
+async function deletePreset(preset) {
+  await persist([{ store: 'presets', delete: preset }]);
+  closeSheet();
+  render();
+  toast('Кнопка удалена', {
+    label: 'Вернуть',
+    run: async () => {
+      await persist([{ store: 'presets', put: preset }]);
+      render();
+    },
+  });
+}
+
+function presetsSection() {
+  return h('div', { class: 'card list' },
+    L.sortPresets(state.presets).map((p) => h('button', { type: 'button', class: 'row', onclick: () => openPresetSheet(p) },
+      h('span', { class: 'row-icon', 'aria-hidden': 'true' }, presetIcon(p)),
+      h('span', { class: 'row-main' },
+        h('span', { class: 'row-title' }, p.label),
+        h('span', { class: 'row-sub' }, `${p.amounts.map((a) => L.formatMoney(a)).join(' / ')} · ${catById(p.categoryId).name}`)),
+      h('span', { class: 'chevron', 'aria-hidden': 'true' }, '›'))),
+    h('button', { type: 'button', class: 'row accent', onclick: () => openPresetSheet() },
+      h('span', { class: 'row-icon', 'aria-hidden': 'true' }, '＋'),
+      h('span', { class: 'row-main' }, h('span', { class: 'row-title' }, 'Новая быстрая кнопка'))));
+}
+
+// ---------- Сводка для ИИ ----------
+
+async function copyText(text, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch {
+    previewText(text); // нет доступа к буферу — покажем текст, чтобы скопировать руками
+  }
+}
+
+async function shareText(text) {
+  try {
+    await navigator.share({ text });
+  } catch (err) {
+    if (err?.name !== 'AbortError') copyText(text, 'Сводка скопирована');
+  }
+}
+
+function previewText(text) {
+  const area = h('textarea', { class: 'input mono ai-text', readonly: true, 'aria-label': 'Сводка для ИИ', rows: 18 });
+  area.value = text;
+  openSheet({
+    title: 'Сводка для ИИ',
+    body: [
+      h('p', { class: 'hint' }, 'Именно этот текст уйдёт в чат с ИИ.'),
+      area,
+      h('div', { class: 'btn-stack' },
+        h('button', { type: 'button', class: 'btn primary', onclick: () => copyText(text, 'Сводка скопирована — вставь её в чат с ИИ') }, '📋 Скопировать')),
+    ],
+    onSave: () => true,
+  });
+}
+
+function aiCard() {
+  const notesOn = () => localGet('aiNotes') === '1';
+  const build = () => L.aiSummary(state, { month: state.month, today: L.todayISO(), includeNotes: notesOn() });
+  return h('section', { class: 'card pad' },
+    h('h2', { class: 'section-title' }, '🤖 Разбор трат с ИИ'),
+    h('p', { class: 'hint' }, `Скопирует сводку за ${L.monthTitle(state.month).toLowerCase()} (плюс два прошлых месяца для сравнения) вместе с готовым вопросом. Вставь в любой бесплатный чат: ChatGPT, Claude, DeepSeek, GigaChat, Алиса.`),
+    h('label', { class: 'toggle-row inset' },
+      h('span', null, 'Добавлять комментарии к тратам'),
+      h('input', { type: 'checkbox', class: 'switch', checked: notesOn(), 'aria-label': 'Добавлять комментарии к тратам', onchange: (e) => localSet('aiNotes', e.target.checked ? '1' : '0') })),
+    h('p', { class: 'hint tip' }, 'Без комментариев уходят только суммы по категориям. Имена из долгов не уходят никогда.'),
+    h('div', { class: 'btn-stack' },
+      h('button', { type: 'button', class: 'btn primary', onclick: () => copyText(build(), 'Сводка скопирована — вставь её в чат с ИИ') }, '📋 Скопировать для ИИ'),
+      navigator.share && h('button', { type: 'button', class: 'btn', onclick: () => shareText(build()) }, '📤 Отправить в приложение'),
+      h('button', { type: 'button', class: 'btn subtle', onclick: () => previewText(build()) }, 'Посмотреть, что уйдёт')));
+}
+
 // ---------- Экран «Операции» ----------
 
 function installCard({ dismissible }) {
@@ -1442,6 +1667,7 @@ function renderList() {
         h('div', null, h('div', { class: 'label' }, 'Доходы'), h('div', { class: 'side-value' }, L.formatMoney(s.income))),
         h('div', null, h('div', { class: 'label' }, 'Баланс'),
           h('div', { class: `side-value${s.balance < 0 ? ' neg' : ''}` }, L.formatMoney(s.balance, { sign: true }))))),
+    quickRow(),
     filterRow,
     list.length
       ? L.groupByDate(list).map((g) => h('section', { class: 'day' },
@@ -1538,6 +1764,7 @@ function renderStats() {
             h('td', null, L.formatMoney(r.income)),
             h('td', { class: bal < 0 ? 'neg' : '' }, L.formatMoney(bal, { sign: true })));
         })))),
+    aiCard(),
   );
 
   // Графики рисуются после вставки в DOM — им нужна реальная ширина
@@ -1848,6 +2075,9 @@ function renderSettings() {
     h('h2', { class: 'section-head' }, 'Синхронизация'),
     syncSection(),
 
+    h('h2', { class: 'section-head' }, 'Быстрые кнопки'),
+    presetsSection(),
+
     h('h2', { class: 'section-head' }, 'Категории'),
     segmented([['expense', 'Расходы'], ['income', 'Доходы']], type, (t) => { state.catType = t; render(); }, 'Тип категорий'),
     h('div', { class: 'card list gap-top' },
@@ -2002,6 +2232,7 @@ async function init() {
       state.categories = L.defaultCategories();
       await db.bulk(state.categories.map((c) => ({ store: 'categories', put: c })));
     }
+    await seedPresets();
     const added = await applyRecurring();
     render();
     updateSyncBadge();

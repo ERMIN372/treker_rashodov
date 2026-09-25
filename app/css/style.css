@@ -989,3 +989,54 @@ html.privacy body > :not(#lock) { visibility: hidden; }
   .tab { font-size: 9.5px; letter-spacing: -0.02em; }
   .tab svg { width: 24px; height: 24px; }
 }
+
+/* ---------- Быстрые кнопки ---------- */
+
+.quick-row {
+  display: flex;
+  gap: 8px;
+  margin-left: -16px;
+  margin-right: -16px;
+  padding: 2px 16px 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.quick-row::-webkit-scrollbar { display: none; }
+
+.quick-btn {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 15px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.quick-btn:active { transform: scale(0.96); background: var(--surface-2); }
+
+.quick-btn.add { padding: 8px 16px; color: var(--accent); font-size: 20px; }
+
+.quick-sum { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+.amount-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+
+.amount-choice {
+  padding: 18px 8px;
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.amount-choice:active { background: var(--surface-2); }
+
+.ai-text { min-height: 50vh; font-size: 13px; line-height: 1.4; white-space: pre-wrap; resize: vertical; }
