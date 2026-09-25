@@ -1,7 +1,7 @@
 // Тонкая обёртка над IndexedDB. Данные живут только на этом устройстве.
 const DB_NAME = 'treker-rashodov';
-const DB_VERSION = 1;
-const DATA_STORES = ['transactions', 'categories', 'recurring'];
+const DB_VERSION = 2; // 2 — долги
+const DATA_STORES = ['transactions', 'categories', 'recurring', 'debts'];
 const ALL_STORES = [...DATA_STORES, 'meta'];
 
 let dbPromise = null;
@@ -9,14 +9,26 @@ let dbPromise = null;
 function openDB() {
   dbPromise ??= new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    // Миграции по шагам: существующие данные не трогаются
+    req.onupgradeneeded = (e) => {
       const d = req.result;
-      d.createObjectStore('transactions', { keyPath: 'id' }).createIndex('date', 'date');
-      d.createObjectStore('categories', { keyPath: 'id' });
-      d.createObjectStore('recurring', { keyPath: 'id' });
-      d.createObjectStore('meta', { keyPath: 'key' });
+      if (e.oldVersion < 1) {
+        d.createObjectStore('transactions', { keyPath: 'id' }).createIndex('date', 'date');
+        d.createObjectStore('categories', { keyPath: 'id' });
+        d.createObjectStore('recurring', { keyPath: 'id' });
+        d.createObjectStore('meta', { keyPath: 'key' });
+      }
+      if (e.oldVersion < 2) d.createObjectStore('debts', { keyPath: 'id' });
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const d = req.result;
+      // Новая версия приложения в другой вкладке обновляет базу — уступаем ей
+      d.onversionchange = () => {
+        d.close();
+        location.reload();
+      };
+      resolve(d);
+    };
     req.onerror = () => reject(req.error);
   });
   return dbPromise;
@@ -85,7 +97,7 @@ export const db = {
       for (const name of DATA_STORES) {
         const s = t.objectStore(name);
         s.clear();
-        for (const v of data[name]) s.put(v);
+        for (const v of data[name] ?? []) s.put(v);
       }
     });
   },

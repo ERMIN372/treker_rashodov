@@ -9,6 +9,7 @@ export const MONTHS_SHORT = ['янв', 'фев', 'мар', 'апр', 'май', '
 const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
 export const TYPES = new Set(['expense', 'income']);
+export const DEBT_DIRECTIONS = new Set(['lent', 'owe']); // lent — мне должны, owe — я должен
 export const PERIODS = new Set(['monthly', 'yearly']);
 
 // ---------- Даты ----------
@@ -283,8 +284,8 @@ export function toCSV(txs, categories) {
 
 export const BACKUP_FORMAT = 'treker-rashodov-backup';
 
-export function makeBackup({ transactions, categories, recurring }, now = new Date()) {
-  return { format: BACKUP_FORMAT, version: 1, exportedAt: now.toISOString(), transactions, categories, recurring };
+export function makeBackup({ transactions, categories, recurring, debts = [] }, now = new Date()) {
+  return { format: BACKUP_FORMAT, version: 1, exportedAt: now.toISOString(), transactions, categories, recurring, debts };
 }
 
 // Проверки записей — общие для резервной копии и файла синхронизации
@@ -294,8 +295,12 @@ const VALIDATORS = {
   transactions: (t) => isId(t?.id) && TYPES.has(t.type) && isAmount(t.amount) && isISODate(t.date) && isId(t.categoryId),
   categories: (c) => isId(c?.id) && typeof c.name === 'string' && TYPES.has(c.type),
   recurring: (r) => isId(r?.id) && TYPES.has(r.type) && isAmount(r.amount) && isISODate(r.startDate) && PERIODS.has(r.period) && isId(r.categoryId),
+  debts: (d) => isId(d?.id) && DEBT_DIRECTIONS.has(d.direction) && typeof d.person === 'string' && d.person.trim() !== ''
+    && isAmount(d.amount) && isISODate(d.date) && (d.dueDate == null || isISODate(d.dueDate))
+    && (d.payments ?? []).every((p) => isId(p?.id) && isAmount(p.amount) && isISODate(p.date))
+    && (d.removedPayments ?? []).every(isId),
 };
-const RECORD_NAMES = { transactions: 'операция', categories: 'категория', recurring: 'регулярный платёж' };
+const RECORD_NAMES = { transactions: 'операция', categories: 'категория', recurring: 'регулярный платёж', debts: 'долг' };
 
 export function parseBackup(text) {
   let data;
@@ -306,14 +311,14 @@ export function parseBackup(text) {
   }
   if (data?.format !== BACKUP_FORMAT) throw new Error('Это не резервная копия трекера расходов.');
   if (data.version > 1) throw new Error('Копия сделана более новой версией приложения — обнови страницу.');
-  const { transactions, categories, recurring = [] } = data;
-  const lists = { transactions, categories, recurring };
+  const { transactions, categories, recurring = [], debts = [] } = data; // в старых копиях долгов нет
+  const lists = { transactions, categories, recurring, debts };
   if (!Object.values(lists).every(Array.isArray)) throw new Error('Копия повреждена.');
-  for (const name of ['categories', 'transactions', 'recurring']) {
+  for (const name of ['categories', 'transactions', 'recurring', 'debts']) {
     const i = lists[name].findIndex((r) => !VALIDATORS[name](r));
     if (i >= 0) throw new Error(`Копия повреждена: ${RECORD_NAMES[name]} №${i + 1}.`);
   }
-  return { transactions, categories, recurring };
+  return lists;
 }
 
 // ---------- Синхронизация: слияние записей ----------
@@ -321,7 +326,8 @@ export function parseBackup(text) {
 // { id, deleted: true, updatedAt }, иначе удалённое на одном устройстве
 // вернулось бы с другого. При конфликте побеждает более свежая версия.
 
-export const SYNC_STORES = ['transactions', 'categories', 'recurring'];
+export const SYNC_STORES = ['transactions', 'categories', 'recurring', 'debts'];
+const OPTIONAL_STORES = new Set(['debts']); // появились позже — в старых файлах их нет
 export const SYNC_FORMAT = 'treker-rashodov-sync';
 
 export const stampOf = (r) => r.updatedAt ?? r.createdAt ?? 0;
@@ -343,13 +349,22 @@ export function isNewer(b, a) {
 
 const maxDate = (x, y) => (!x ? y ?? null : !y ? x : x > y ? x : y);
 
+const unionById = (x = [], y = []) => [...new Map([...x, ...y].map((p) => [p.id, p])).values()].sort((p, q) => (p.date + p.id < q.date + q.id ? -1 : 1));
+
 // Итог слияния двух версий одной записи. У правил регулярных платежей
 // lastDate берётся максимальный, чтобы платёж не записался второй раз.
+// У долгов возвраты объединяются: внесённые на двух устройствах не теряются.
 export function resolveRecord(a, b, store) {
   let winner = isNewer(b, a) ? b : a;
   if (store === 'recurring' && !a.deleted && !b.deleted) {
     const lastDate = maxDate(a.lastDate, b.lastDate);
     if ((winner.lastDate ?? null) !== lastDate) winner = { ...winner, lastDate };
+  }
+  if (store === 'debts' && !a.deleted && !b.deleted) {
+    const payments = unionById(a.payments, b.payments);
+    const removed = [...new Set([...(a.removedPayments ?? []), ...(b.removedPayments ?? [])])].sort();
+    const merged = { ...winner, payments, removedPayments: removed };
+    if (recordKey(merged) !== recordKey(winner)) winner = merged;
   }
   return winner;
 }
@@ -374,7 +389,7 @@ export function mergeStore(local, remote, store) {
 // По записи на строку и в стабильном порядке — история в GitHub читается как дифф
 export function serializeSync(data, now = new Date()) {
   const order = (a, b) => ((a.date ?? '') + a.id < (b.date ?? '') + b.id ? -1 : 1);
-  const block = (name) => `"${name}": [\n${[...data[name]].sort(order).map((r) => JSON.stringify(r)).join(',\n')}\n]`;
+  const block = (name) => `"${name}": [\n${[...(data[name] ?? [])].sort(order).map((r) => JSON.stringify(r)).join(',\n')}\n]`;
   return `{"format": "${SYNC_FORMAT}", "version": 1, "savedAt": "${now.toISOString()}",\n${SYNC_STORES.map(block).join(',\n')}\n}\n`;
 }
 
@@ -388,6 +403,7 @@ export function parseSyncData(text) {
   if (data?.format !== SYNC_FORMAT) throw new Error('В репозитории лежит посторонний файл rashody.json — выбери другой репозиторий.');
   if (data.version > 1) throw new Error('Данные записаны более новой версией приложения — обнови страницу.');
   for (const name of SYNC_STORES) {
+    if (data[name] === undefined && OPTIONAL_STORES.has(name)) data[name] = [];
     if (!Array.isArray(data[name])) throw new Error('Файл синхронизации повреждён.');
     const i = data[name].findIndex((r) => !(isTombstone(r) || VALIDATORS[name](r)));
     if (i >= 0) throw new Error(`Файл синхронизации повреждён: ${RECORD_NAMES[name]} №${i + 1}.`);
@@ -424,4 +440,44 @@ export function deviceName(ua = '') {
   if (/Windows/.test(ua)) return 'Windows';
   if (/Linux/.test(ua)) return 'Linux';
   return 'устройство';
+}
+
+// ---------- Долги ----------
+// { id, direction: 'lent' | 'owe', person, amount, note, date, dueDate?, payments: [{ id, amount, date }], removedPayments: [id] }
+// Возвраты хранятся списком внутри долга; удалённый возврат помечается в removedPayments,
+// чтобы при синхронизации он не вернулся с другого устройства.
+
+export const livePayments = (d) => {
+  const removed = new Set(d.removedPayments ?? []);
+  return (d.payments ?? []).filter((p) => !removed.has(p.id));
+};
+export const debtPaid = (d) => livePayments(d).reduce((sum, p) => sum + p.amount, 0);
+export const debtRemaining = (d) => Math.max(0, d.amount - debtPaid(d));
+export const isDebtClosed = (d) => debtRemaining(d) === 0;
+export const isDebtOverdue = (d, today) => !isDebtClosed(d) && Boolean(d.dueDate) && d.dueDate < today;
+
+export function summarizeDebts(debts) {
+  let lent = 0;
+  let owe = 0;
+  for (const d of debts) {
+    if (d.direction === 'lent') lent += debtRemaining(d);
+    else owe += debtRemaining(d);
+  }
+  return { lent, owe, net: lent - owe };
+}
+
+// Открытые: сначала просроченные, потом по сроку, без срока — в конце, свежие выше
+export function sortDebts(debts, today) {
+  const key = (d) => [isDebtOverdue(d, today) ? 0 : 1, d.dueDate ?? '9999-99-99', d.date];
+  return [...debts].sort((a, b) => {
+    const [ka, kb] = [key(a), key(b)];
+    return ka[0] - kb[0] || ka[1].localeCompare(kb[1]) || kb[2].localeCompare(ka[2]);
+  });
+}
+
+// Имена людей для подсказки при вводе: самые частые сверху
+export function debtPeople(debts) {
+  const count = new Map();
+  for (const d of debts) count.set(d.person, (count.get(d.person) ?? 0) + 1);
+  return [...count.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ru')).map(([name]) => name);
 }

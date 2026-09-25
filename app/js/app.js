@@ -11,7 +11,7 @@ const IS_DEV = APP_BUILD.startsWith('__');
 
 const SERIES_COLOR = { expense: 'var(--s-expense)', income: 'var(--s-income)' };
 const TYPE_LABEL = { expense: 'Расход', income: 'Доход' };
-const TITLES = { list: 'Операции', stats: 'Статистика', recurring: 'Регулярные', settings: 'Настройки' };
+const TITLES = { list: 'Операции', stats: 'Статистика', recurring: 'Регулярные', debts: 'Долги', settings: 'Настройки' };
 const TX_FORMS = ['операция', 'операции', 'операций'];
 const BACKUP_EVERY_MS = 30 * 24 * 3600 * 1000;
 const SNOOZE_MS = 7 * 24 * 3600 * 1000;
@@ -20,6 +20,8 @@ const state = {
   transactions: [],
   categories: [],
   recurring: [],
+  debts: [],
+  debtFilter: 'open',
   month: L.monthKey(L.todayISO()),
   tab: 'list',
   statsType: 'expense',
@@ -618,6 +620,7 @@ async function clearAll() {
   Object.assign(state, {
     transactions: [],
     recurring: [],
+    debts: [],
     categories: L.defaultCategories(),
     tombstones: Object.fromEntries(L.SYNC_STORES.map((s) => [s, new Set()])),
     filterCategory: null,
@@ -1595,6 +1598,227 @@ function renderRecurring() {
   );
 }
 
+// ---------- Долги ----------
+// Долг — не расход: дать в долг не значит потратить, поэтому в операции он не попадает.
+
+const DEBT_LABEL = { lent: 'Мне должны', owe: 'Я должен' };
+const shortDay = (iso) => `${Number(iso.slice(8, 10))} ${L.MONTHS_SHORT[Number(iso.slice(5, 7)) - 1]}`;
+const debtSign = (d, kop) => L.formatMoney(d.direction === 'lent' ? kop : -kop, { sign: true });
+
+function debtRow(d, today) {
+  const remaining = L.debtRemaining(d);
+  const closed = remaining === 0;
+  const overdue = L.isDebtOverdue(d, today);
+  // Самое важное — первым: строка обрезается справа
+  const bits = [
+    closed ? 'погашен' : d.dueDate ? `${overdue ? '⏰ просрочен с' : 'до'} ${shortDay(d.dueDate)}` : `с ${shortDay(d.date)}`,
+    !closed && remaining !== d.amount && `осталось из ${L.formatMoney(d.amount)}`,
+    d.note,
+  ].filter(Boolean);
+  return h('button', { type: 'button', class: `row${closed ? ' paused' : ''}`, onclick: () => openDebtSheet(d) },
+    h('span', { class: 'row-icon', 'aria-hidden': 'true' }, d.direction === 'lent' ? '📤' : '📥'),
+    h('span', { class: 'row-main' },
+      h('span', { class: 'row-title' }, d.person),
+      h('span', { class: `row-sub${overdue ? ' neg' : ''}` }, bits.join(' · '))),
+    h('span', { class: `row-amount ${d.direction === 'lent' ? 'pos' : 'neg'}` }, debtSign(d, closed ? d.amount : remaining)));
+}
+
+function renderDebts() {
+  const today = L.todayISO();
+  const open = state.debts.filter((d) => !L.isDebtClosed(d));
+  const closed = state.debts.filter((d) => L.isDebtClosed(d));
+  const s = L.summarizeDebts(state.debts);
+  const shown = state.debtFilter === 'closed'
+    ? [...closed].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+    : L.sortDebts(open, today);
+  const groups = [['lent', 'Мне должны'], ['owe', 'Я должен']]
+    .map(([dir, title]) => [title, shown.filter((d) => d.direction === dir)])
+    .filter(([, list]) => list.length);
+  const groupSum = (list) => list.reduce((sum, d) => sum + (state.debtFilter === 'closed' ? d.amount : L.debtRemaining(d)), 0);
+
+  mount($('#view-debts'),
+    h('section', { class: 'card summary' },
+      h('div', { class: 'summary-side debts-summary' },
+        h('div', null, h('div', { class: 'label' }, 'Мне должны'), h('div', { class: 'side-value pos' }, L.formatMoney(s.lent))),
+        h('div', null, h('div', { class: 'label' }, 'Я должен'), h('div', { class: 'side-value neg' }, L.formatMoney(s.owe)))),
+      (s.lent || s.owe) ? h('p', { class: 'hint' }, `Итого ${s.net >= 0 ? 'в плюсе' : 'в минусе'}: ${L.formatMoney(s.net, { sign: true })}`) : null),
+    segmented([['open', `Активные${open.length ? ` · ${open.length}` : ''}`], ['closed', 'Погашенные']], state.debtFilter, (f) => {
+      state.debtFilter = f;
+      render();
+    }, 'Какие долги показать'),
+    groups.length
+      ? groups.map(([title, list]) => h('section', { class: 'day' },
+        h('header', { class: 'day-head' }, h('span', null, title), h('span', null, L.formatMoney(groupSum(list)))),
+        h('div', { class: 'card list' }, list.map((d) => debtRow(d, today)))))
+      : h('div', { class: 'empty' },
+        h('div', { class: 'empty-emoji', 'aria-hidden': 'true' }, state.debtFilter === 'closed' ? '🗂️' : '🤝'),
+        h('p', null, state.debtFilter === 'closed' ? 'Погашенных долгов пока нет.' : 'Активных долгов нет.'),
+        state.debtFilter === 'open' && h('p', { class: 'hint' }, 'Нажми «+», чтобы записать, кто кому должен.')),
+  );
+}
+
+// Красная точка на вкладке, если есть просроченные долги
+function updateDebtDot() {
+  const today = L.todayISO();
+  const overdue = state.debts.filter((d) => L.isDebtOverdue(d, today)).length;
+  $('#debtDot').hidden = overdue === 0;
+  const tab = $('.tab[data-tab="debts"]');
+  if (overdue) tab.setAttribute('aria-label', `Долги: просрочено ${overdue}`);
+  else tab.removeAttribute('aria-label');
+}
+
+async function remindDebt(d) {
+  const text = `Привет! Напоминаю про ${L.formatMoney(L.debtRemaining(d))}${d.note ? ` (${d.note})` : ''} от ${L.shortDate(d.date)}. Спасибо!`;
+  try {
+    if (navigator.share) {
+      await navigator.share({ text });
+      return;
+    }
+    await navigator.clipboard.writeText(text);
+    toast('Текст напоминания скопирован');
+  } catch (err) {
+    if (err?.name !== 'AbortError') prompt('Скопируй напоминание:', text);
+  }
+}
+
+function openDebtSheet(debt = null) {
+  const today = L.todayISO();
+  const draft = {
+    direction: debt?.direction ?? 'lent',
+    payments: [...(debt?.payments ?? [])],
+    removed: new Set(debt?.removedPayments ?? []),
+  };
+  const amount = amountInput(debt?.amount);
+  const person = h('input', { class: 'input', maxlength: 60, list: 'debtPeople', autocomplete: 'off', placeholder: 'Имя', value: debt?.person ?? '', 'aria-label': 'Кто' });
+  const people = h('datalist', { id: 'debtPeople' }, L.debtPeople(state.debts).map((name) => h('option', { value: name })));
+  const note = h('input', { class: 'input', maxlength: 120, enterkeyhint: 'done', placeholder: 'За что: такси, ужин, до зарплаты…', value: debt?.note ?? '' });
+  const date = dateInput(debt?.date ?? today);
+  const due = dateInput(debt?.dueDate ?? '');
+  const err = h('p', { class: 'form-error', role: 'alert' });
+  const paymentsBox = h('div', { class: 'payments' });
+  const payAmount = h('input', { class: 'input', inputmode: 'decimal', autocomplete: 'off', placeholder: 'Сумма возврата', 'aria-label': 'Сумма возврата' });
+
+  // Черновик: возвраты сохраняются вместе с остальными полями по «Готово»
+  const current = () => ({ amount: L.parseAmount(amount.input.value) ?? debt?.amount ?? 0, payments: draft.payments, removedPayments: [...draft.removed] });
+  const drawPayments = () => {
+    const live = L.livePayments(current());
+    const left = L.debtRemaining(current());
+    payAmount.placeholder = left ? `Осталось ${L.formatMoney(left)}` : 'Долг погашен';
+    mount(paymentsBox,
+      h('p', { class: 'hint' }, `Возвращено ${L.formatMoney(L.debtPaid(current()))} из ${L.formatMoney(current().amount)}${left ? '' : ' — погашен ✅'}`),
+      live.length > 0 && h('div', { class: 'card list' }, live.map((p) => h('div', { class: 'row static' },
+        h('span', { class: 'row-main' }, h('span', { class: 'row-title' }, L.formatMoney(p.amount)), h('span', { class: 'row-sub' }, L.shortDate(p.date))),
+        h('button', {
+          type: 'button',
+          class: 'chip',
+          'aria-label': `Удалить возврат ${L.formatMoney(p.amount)}`,
+          onclick: () => {
+            draft.removed.add(p.id);
+            drawPayments();
+          },
+        }, '✕')))));
+  };
+  const addPayment = (kop) => {
+    const left = L.debtRemaining(current());
+    if (!kop) {
+      err.textContent = 'Введи сумму возврата';
+      return false;
+    }
+    if (kop > left) {
+      err.textContent = `Это больше остатка долга (${L.formatMoney(left)})`;
+      return false;
+    }
+    draft.payments.push({ id: uid(), amount: kop, date: today });
+    err.textContent = '';
+    payAmount.value = '';
+    drawPayments();
+    return true;
+  };
+  if (debt) drawPayments();
+
+  openSheet({
+    title: debt ? 'Долг' : 'Новый долг',
+    body: [
+      segmented([['lent', 'Мне должны'], ['owe', 'Я должен']], draft.direction, (dir) => { draft.direction = dir; }, 'Кто кому должен'),
+      amount.el,
+      err,
+      field('Кто', person, people),
+      field('Комментарий', note),
+      field('Когда', date),
+      field('Вернуть до (необязательно)', h('div', { class: 'date-row' }, due,
+        h('button', { type: 'button', class: 'chip', onclick: () => { due.value = ''; } }, 'Без срока'))),
+      debt && h('div', { class: 'field' },
+        h('span', { class: 'field-label' }, 'Возвраты'),
+        paymentsBox,
+        h('div', { class: 'date-row' }, payAmount,
+          h('button', { type: 'button', class: 'chip', onclick: () => addPayment(L.parseAmount(payAmount.value)) }, 'Записать')),
+        h('div', { class: 'btn-stack' },
+          !L.isDebtClosed(debt) && h('button', {
+            type: 'button',
+            class: 'btn primary',
+            onclick: () => {
+              if (addPayment(L.debtRemaining(current()))) sheet.querySelector('form').requestSubmit();
+            },
+          }, '✅ Погашен полностью'),
+          debt.direction === 'lent' && !L.isDebtClosed(debt) && h('button', { type: 'button', class: 'btn', onclick: () => remindDebt(debt) }, '📨 Напомнить'))),
+      debt && h('button', { type: 'button', class: 'danger-btn', onclick: () => deleteDebt(debt) }, 'Удалить долг'),
+      !debt && h('p', { class: 'hint' }, 'Долг не попадает в расходы и доходы — он учитывается только здесь. Частичные возвраты можно записать, открыв долг.'),
+    ],
+    onSave: async () => {
+      const kop = L.parseAmount(amount.input.value);
+      if (!kop) {
+        err.textContent = 'Введи сумму больше нуля';
+        amount.input.focus();
+        return false;
+      }
+      const name = person.value.trim();
+      if (!name) {
+        err.textContent = 'Укажи, кто';
+        person.focus();
+        return false;
+      }
+      if (!L.isISODate(date.value)) {
+        err.textContent = 'Укажи дату';
+        return false;
+      }
+      if (due.value && due.value < date.value) {
+        err.textContent = 'Срок возврата раньше даты долга';
+        return false;
+      }
+      const item = {
+        ...(debt ?? { id: uid(), createdAt: Date.now() }),
+        direction: draft.direction,
+        amount: kop,
+        person: name,
+        note: note.value.trim(),
+        date: date.value,
+        dueDate: due.value || null,
+        payments: draft.payments,
+        removedPayments: [...draft.removed],
+      };
+      await persist([{ store: 'debts', put: item }]);
+      render();
+      const closedNow = L.isDebtClosed(item) && !(debt && L.isDebtClosed(debt));
+      toast(closedNow ? `Долг: ${item.person} — погашен 🎉` : debt ? 'Сохранено' : `Записано: ${DEBT_LABEL[item.direction].toLowerCase()} ${L.formatMoney(kop)}`);
+      return true;
+    },
+  });
+  if (!debt) amount.input.focus();
+}
+
+async function deleteDebt(debt) {
+  await persist([{ store: 'debts', delete: debt }]);
+  closeSheet();
+  render();
+  toast('Долг удалён', {
+    label: 'Вернуть',
+    run: async () => {
+      await persist([{ store: 'debts', put: debt }]);
+      render();
+    },
+  });
+}
+
 // ---------- Экран «Настройки» ----------
 
 function renderSettings() {
@@ -1658,7 +1882,7 @@ function renderSettings() {
 
 // ---------- Общий рендер и навигация ----------
 
-const VIEWS = { list: renderList, stats: renderStats, recurring: renderRecurring, settings: renderSettings };
+const VIEWS = { list: renderList, stats: renderStats, recurring: renderRecurring, debts: renderDebts, settings: renderSettings };
 
 function render() {
   const { tab } = state;
@@ -1676,6 +1900,7 @@ function render() {
     h('span', { class: 'm-short' }, `${L.MONTHS_SHORT[m - 1]} ${y}`));
   monthLabel.classList.toggle('not-current', state.month !== L.monthKey(L.todayISO()));
   $('#addBtn').hidden = tab === 'settings';
+  updateDebtDot();
   VIEWS[tab]();
 }
 
@@ -1697,7 +1922,11 @@ function bindStatic() {
     state.month = L.monthKey(L.todayISO());
     render();
   });
-  $('#addBtn').addEventListener('click', () => (state.tab === 'recurring' ? openRuleSheet() : openTxSheet()));
+  $('#addBtn').addEventListener('click', () => {
+    if (state.tab === 'recurring') openRuleSheet();
+    else if (state.tab === 'debts') openDebtSheet();
+    else openTxSheet();
+  });
 
   // Вернулись в приложение (например, на следующий день) — дописываем платежи
   // и забираем изменения с других устройств; уходим — отправляем несохранённое
