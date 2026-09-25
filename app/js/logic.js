@@ -62,7 +62,7 @@ export const MAX_AMOUNT = 99_999_999_999; // копейки, чуть меньш
 
 // '1 234,56' → 123456; мусор, ноль и больше двух знаков после запятой → null
 export function parseAmount(input) {
-  const s = String(input ?? '').replace(/[\s  ₽]/g, '').replace(',', '.');
+  const s = String(input ?? '').replace(/[\s\u00a0\u202f₽]/g, '').replace(',', '.');
   if (!/^(\d+\.?\d{0,2}|\.\d{1,2})$/.test(s)) return null;
   const kop = Math.round(Number(s) * 100);
   return kop > 0 && kop <= MAX_AMOUNT ? kop : null;
@@ -80,7 +80,7 @@ export function formatMoney(kop, { sign = false } = {}) {
   const abs = Math.abs(kop);
   const body = (abs % 100 === 0 ? fmt0 : fmt2).format(abs / 100);
   const prefix = kop < 0 ? '−' : sign && kop > 0 ? '+' : '';
-  return `${prefix}${body} ₽`;
+  return `${prefix}${body}\u00a0₽`;
 }
 
 // Подписи осей: 12 тыс., 1,5 млн
@@ -284,8 +284,8 @@ export function toCSV(txs, categories) {
 
 export const BACKUP_FORMAT = 'treker-rashodov-backup';
 
-export function makeBackup({ transactions, categories, recurring, debts = [] }, now = new Date()) {
-  return { format: BACKUP_FORMAT, version: 1, exportedAt: now.toISOString(), transactions, categories, recurring, debts };
+export function makeBackup({ transactions, categories, recurring, debts = [], presets = [] }, now = new Date()) {
+  return { format: BACKUP_FORMAT, version: 1, exportedAt: now.toISOString(), transactions, categories, recurring, debts, presets };
 }
 
 // Проверки записей — общие для резервной копии и файла синхронизации
@@ -299,8 +299,10 @@ const VALIDATORS = {
     && isAmount(d.amount) && isISODate(d.date) && (d.dueDate == null || isISODate(d.dueDate))
     && (d.payments ?? []).every((p) => isId(p?.id) && isAmount(p.amount) && isISODate(p.date))
     && (d.removedPayments ?? []).every(isId),
+  presets: (p) => isId(p?.id) && typeof p.label === 'string' && p.label.trim() !== '' && TYPES.has(p.type) && isId(p.categoryId)
+    && Array.isArray(p.amounts) && p.amounts.length >= 1 && p.amounts.length <= MAX_PRESET_AMOUNTS && p.amounts.every(isAmount),
 };
-const RECORD_NAMES = { transactions: 'операция', categories: 'категория', recurring: 'регулярный платёж', debts: 'долг' };
+const RECORD_NAMES = { transactions: 'операция', categories: 'категория', recurring: 'регулярный платёж', debts: 'долг', presets: 'быстрая кнопка' };
 
 export function parseBackup(text) {
   let data;
@@ -311,10 +313,11 @@ export function parseBackup(text) {
   }
   if (data?.format !== BACKUP_FORMAT) throw new Error('Это не резервная копия трекера расходов.');
   if (data.version > 1) throw new Error('Копия сделана более новой версией приложения — обнови страницу.');
-  const { transactions, categories, recurring = [], debts = [] } = data; // в старых копиях долгов нет
-  const lists = { transactions, categories, recurring, debts };
+  // в старых копиях долгов и быстрых кнопок нет
+  const { transactions, categories, recurring = [], debts = [], presets = [] } = data;
+  const lists = { transactions, categories, recurring, debts, presets };
   if (!Object.values(lists).every(Array.isArray)) throw new Error('Копия повреждена.');
-  for (const name of ['categories', 'transactions', 'recurring', 'debts']) {
+  for (const name of Object.keys(lists)) {
     const i = lists[name].findIndex((r) => !VALIDATORS[name](r));
     if (i >= 0) throw new Error(`Копия повреждена: ${RECORD_NAMES[name]} №${i + 1}.`);
   }
@@ -326,8 +329,8 @@ export function parseBackup(text) {
 // { id, deleted: true, updatedAt }, иначе удалённое на одном устройстве
 // вернулось бы с другого. При конфликте побеждает более свежая версия.
 
-export const SYNC_STORES = ['transactions', 'categories', 'recurring', 'debts'];
-const OPTIONAL_STORES = new Set(['debts']); // появились позже — в старых файлах их нет
+export const SYNC_STORES = ['transactions', 'categories', 'recurring', 'debts', 'presets'];
+const OPTIONAL_STORES = new Set(['debts', 'presets']); // появились позже — в старых файлах их нет
 export const SYNC_FORMAT = 'treker-rashodov-sync';
 
 export const stampOf = (r) => r.updatedAt ?? r.createdAt ?? 0;
@@ -480,4 +483,127 @@ export function debtPeople(debts) {
   const count = new Map();
   for (const d of debts) count.set(d.person, (count.get(d.person) ?? 0) + 1);
   return [...count.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ru')).map(([name]) => name);
+}
+
+// ---------- Быстрые кнопки ----------
+// { id, emoji, label, type, categoryId, amounts: [копейки…], note, order }
+// Одна сумма — запись в один тап; несколько — выбор из них.
+
+export const MAX_PRESET_AMOUNTS = 8;
+
+// «200, 300, 400» или «200 / 300»; запятая без пробела — это копейки: «99,90»
+export function parseAmounts(input) {
+  const parts = String(input ?? '').split(/\s*[;/|]\s*|,\s+|\s{2,}/).map((x) => x.trim()).filter(Boolean);
+  if (!parts.length || parts.length > MAX_PRESET_AMOUNTS) return null;
+  const amounts = parts.map(parseAmount);
+  return amounts.every(Boolean) ? amounts : null;
+}
+
+export const formatAmounts = (amounts) => amounts.map(amountToInput).join(', ');
+
+export const sortPresets = (presets) => [...presets].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.label.localeCompare(b.label, 'ru'));
+
+// ---------- Сводка для ИИ ----------
+// Только агрегаты: имена из долгов не уходят никогда, комментарии — по желанию.
+
+export const AI_PROMPT = `Ты — внимательный финансовый аналитик. Ниже сводка моих личных расходов и доходов из трекера (валюта — рубли). Разбери её и ответь по-русски, кратко и по делу, без морализаторства:
+
+1. Итог месяца в 3–5 пунктах: сколько потрачено, куда ушло больше всего, как это соотносится с доходами.
+2. Что заметно выросло или упало по сравнению с прошлыми месяцами — с цифрами и процентами.
+3. Необычные или крупные разовые траты, на которые стоит обратить внимание.
+4. Частые мелкие траты: сколько они съедают за месяц и как их сократить.
+5. Регулярные платежи и подписки: что выглядит лишним или дорогим.
+6. Три конкретных совета на следующий месяц с оценкой экономии в рублях.
+7. Реалистичный лимит на следующий месяц по основным категориям.
+
+Если месяц ещё не закончился или данных мало — учитывай это и не делай поспешных выводов.`;
+
+const pct = (cur, prev) => {
+  const p = percentChange(cur, prev);
+  return p === null ? '' : ` (${p >= 0 ? '+' : '−'}${Math.round(Math.abs(p) * 100)}% к прошлому)`;
+};
+
+export function aiSummary(data, { month, today, includeNotes = false, months = 3 }) {
+  const { transactions, categories, recurring = [], debts = [] } = data;
+  const cats = new Map(categories.map((c) => [c.id, c.name]));
+  const catName = (id) => cats.get(id) ?? 'Без категории';
+  // Прошлые месяцы без единой записи — шум, их не показываем
+  const keys = Array.from({ length: months }, (_, i) => shiftMonth(month, i - months + 1))
+    .filter((key) => key === month || inMonth(transactions, key).length > 0);
+  const current = month === monthKey(today);
+  const title = (key) => monthTitle(key).toLowerCase();
+  const money = (kop) => formatMoney(kop).replace(/\u00a0/g, ' ');
+  const rub = (kop) => money(Math.round(kop / 100) * 100); // средние — без копеек
+  const lines = [];
+
+  const compare = keys.length > 1 ? `; для сравнения — ${keys.slice(0, -1).map(title).join(' и ')}` : '; прошлых месяцев для сравнения нет';
+  lines.push(`Период: ${title(month)}${current ? ` (данные по ${parseISO(today).d} число — месяц ещё идёт)` : ''}${compare}.`);
+
+  lines.push('', 'Итоги по месяцам:');
+  const sums = keys.map((key) => ({ key, ...summarize(inMonth(transactions, key)) }));
+  for (const r of sums) {
+    const days = daysForAverage(r.key, today);
+    lines.push(`- ${monthTitle(r.key)}: расходы ${money(r.expense)}, доходы ${money(r.income)}, баланс ${formatMoney(r.balance, { sign: true }).replace(/\u00a0/g, ' ')}, в среднем ${rub(r.expense / days)} в день`);
+  }
+
+  const expenseByCat = keys.map((key) => new Map(byCategory(inMonth(transactions, key), 'expense').map((e) => [e.categoryId, e.total])));
+  const catIds = [...new Set(expenseByCat.flatMap((mp) => [...mp.keys()]))]
+    .sort((a, b) => (expenseByCat.at(-1).get(b) ?? 0) - (expenseByCat.at(-1).get(a) ?? 0));
+  if (catIds.length) {
+    lines.push('', `Расходы по категориям (${keys.map((k) => MONTHS_SHORT[Number(k.slice(5)) - 1]).join(' / ')}):`);
+    for (const id of catIds) {
+      const vals = expenseByCat.map((mp) => mp.get(id) ?? 0);
+      lines.push(`- ${catName(id)}: ${vals.map((v) => money(v)).join(' / ')}${pct(vals.at(-1), vals.at(-2))}`);
+    }
+  }
+
+  const monthTx = inMonth(transactions, month);
+  const incomeCats = byCategory(monthTx, 'income');
+  if (incomeCats.length) {
+    lines.push('', `Доходы за ${title(month)}:`);
+    for (const e of incomeCats) lines.push(`- ${catName(e.categoryId)}: ${money(e.total)}`);
+  }
+
+  const expenses = monthTx.filter((t) => t.type === 'expense');
+  // Частые траты: по комментарию (если можно) или по категории
+  const groupKey = (t) => (includeNotes && t.note ? `${catName(t.categoryId)} — «${t.note}»` : catName(t.categoryId));
+  const freq = new Map();
+  for (const t of expenses) {
+    if (t.recurringId) continue;
+    const e = freq.get(groupKey(t)) ?? { count: 0, total: 0, max: 0 };
+    e.count += 1;
+    e.total += t.amount;
+    e.max = Math.max(e.max, t.amount);
+    freq.set(groupKey(t), e);
+  }
+  const frequent = [...freq.entries()].filter(([, e]) => e.count >= 3).sort((a, b) => b[1].total - a[1].total).slice(0, 10);
+
+  // Крупные разовые: без однотипных мелких, которые уже посчитаны как частые
+  const small = new Set(frequent.filter(([, e]) => e.max <= (e.total / e.count) * 1.5).map(([key]) => key));
+  const top = expenses.filter((t) => !small.has(groupKey(t))).sort((a, b) => b.amount - a.amount).slice(0, 7);
+  if (top.length) {
+    lines.push('', `Крупнейшие расходы за ${title(month)}:`);
+    for (const t of top) lines.push(`- ${shortDate(t.date)}, ${catName(t.categoryId)}: ${money(t.amount)}${includeNotes && t.note ? ` — «${t.note}»` : ''}${t.recurringId ? ' (регулярный)' : ''}`);
+  }
+
+  if (frequent.length) {
+    lines.push('', `Частые траты за ${title(month)} (от 3 раз):`);
+    for (const [key, e] of frequent) lines.push(`- ${key}: ${e.count} раз, в среднем ${rub(e.total / e.count)}, всего ${money(e.total)}`);
+  }
+
+  const rules = recurring.filter((r) => r.active && r.type === 'expense');
+  if (rules.length) {
+    lines.push('', 'Регулярные платежи (активные):');
+    for (const r of rules) lines.push(`- ${catName(r.categoryId)}${includeNotes && r.note ? ` «${r.note}»` : ''}: ${money(r.amount)} ${r.period === 'yearly' ? 'в год' : 'в месяц'}`);
+    lines.push(`Итого регулярных расходов ≈ ${money(rules.reduce((sum, r) => sum + monthlyEquivalent(r), 0))} в месяц.`);
+  }
+
+  const open = debts.filter((d) => !isDebtClosed(d));
+  if (open.length) {
+    const s = summarizeDebts(open);
+    const overdue = open.filter((d) => isDebtOverdue(d, today)).length;
+    lines.push('', `Долги (открытые, без имён): мне должны ${money(s.lent)}, я должен ${money(s.owe)}${overdue ? `, просрочено: ${overdue}` : ''}.`);
+  }
+
+  return `${AI_PROMPT}\n\nДанные:\n${lines.join('\n')}\n`;
 }

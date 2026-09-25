@@ -190,10 +190,64 @@ test('резервная копия: туда и обратно, битые фа
     recurring: [{ id: 'r1', type: 'expense', amount: 29900, categoryId: 'exp-subs', startDate: '2026-01-05', period: 'monthly', lastDate: null, active: true }],
   };
   const restored = L.parseBackup(JSON.stringify(L.makeBackup(data, new Date('2026-09-24T10:00:00Z'))));
-  assert.deepEqual(restored, { ...data, debts: [] }, 'старые копии без долгов читаются');
+  assert.deepEqual(restored, { ...data, debts: [], presets: [] }, 'старые копии без долгов и кнопок читаются');
 
   assert.throws(() => L.parseBackup('не json'), /JSON/);
   assert.throws(() => L.parseBackup('{"a":1}'), /не резервная копия/);
   const broken = L.makeBackup({ ...data, transactions: [{ ...data.transactions[0], amount: -5 }] });
   assert.throws(() => L.parseBackup(JSON.stringify(broken)), /операция №1/);
+});
+
+test('быстрые кнопки: разбор сумм', () => {
+  assert.deepEqual(L.parseAmounts('200, 300, 400, 500'), [20000, 30000, 40000, 50000]);
+  assert.deepEqual(L.parseAmounts('230'), [23000]);
+  assert.deepEqual(L.parseAmounts('99,90'), [9990], 'запятая без пробела — копейки');
+  assert.deepEqual(L.parseAmounts('200 / 300; 400'), [20000, 30000, 40000]);
+  for (const bad of ['', 'abc', '200, 0', '1,2,3', '1, 2, 3, 4, 5, 6, 7, 8, 9']) assert.equal(L.parseAmounts(bad), null, bad);
+  assert.equal(L.formatAmounts([20000, 9990]), '200, 99,90');
+  assert.deepEqual(L.sortPresets([{ label: 'Б', order: 2 }, { label: 'А', order: 2 }, { label: 'В', order: 1 }]).map((p) => p.label), ['В', 'А', 'Б']);
+});
+
+test('сводка для ИИ: промпт, сравнение месяцев, приватность', () => {
+  const cats = [...L.defaultCategories(), { id: 'exp-tobacco', type: 'expense', name: 'Табак', emoji: '🚬', order: 50 }];
+  const tx = (id, date, amount, categoryId, note = '', type = 'expense') => ({ id, date, amount, categoryId, note, type });
+  const transactions = [
+    tx('a1', '2026-08-05', 100000, 'exp-food', 'Ашан'),
+    tx('a2', '2026-08-10', 300000, 'inc-salary', 'зп', 'income'),
+    tx('s1', '2026-09-02', 23000, 'exp-tobacco', 'Стики IQOS'),
+    tx('s2', '2026-09-05', 23000, 'exp-tobacco', 'Стики IQOS'),
+    tx('s3', '2026-09-09', 23000, 'exp-tobacco', 'Стики IQOS'),
+    tx('f1', '2026-09-10', 150000, 'exp-food', 'Ашан'),
+    tx('c1', '2026-09-12', 540000, 'exp-clothes', 'Секретная покупка'),
+  ];
+  const debts = [{ id: 'd', direction: 'lent', person: 'Лёха Иванов', amount: 150000, date: '2026-09-01', payments: [] }];
+  const recurring = [{ id: 'r', type: 'expense', amount: 29900, categoryId: 'exp-subs', note: 'Spotify', startDate: '2026-01-15', period: 'monthly', active: true }];
+  const data = { transactions, categories: cats, recurring, debts };
+
+  const text = L.aiSummary(data, { month: '2026-09', today: '2026-09-25' });
+  assert.ok(text.startsWith(L.AI_PROMPT), 'сначала промпт');
+  assert.match(text, /сентябрь 2026 \(данные по 25 число — месяц ещё идёт\)/);
+  assert.match(text, /Продукты: 1 000 ₽ \/ 1 500 ₽ \(\+50% к прошлому\)/, 'сравнение с прошлым месяцем в процентах');
+  assert.ok(!text.includes('Июль'), 'пустой июль не засоряет сводку');
+  assert.ok(!/\d+ сентября, Табак: 230/.test(text), 'частые мелкие не дублируются в крупнейших');
+  assert.match(text, /\d+ сентября, Одежда: 5 400 ₽/, 'крупная разовая трата в списке');
+  assert.match(text, /Табак: 3 раз, в среднем 230 ₽, всего 690 ₽/, 'частые траты');
+  assert.match(text, /мне должны 1 500 ₽/);
+  assert.match(text, /Подписки: 299 ₽ в месяц/);
+  for (const secret of ['Лёха', 'Иванов', 'Секретная', 'Spotify', 'Ашан']) assert.ok(!text.includes(secret), `без комментариев и имён: ${secret}`);
+
+  const withNotes = L.aiSummary(data, { month: '2026-09', today: '2026-09-25', includeNotes: true });
+  assert.ok(withNotes.includes('Секретная покупка') && withNotes.includes('Spotify'), 'с разрешения комментарии есть');
+  assert.ok(!withNotes.includes('Лёха'), 'имена из долгов не уходят никогда');
+
+  const empty = L.aiSummary({ transactions: [], categories: cats }, { month: '2026-09', today: '2026-09-25' });
+  assert.match(empty, /расходы 0 ₽/);
+});
+
+test('резервная копия: быстрые кнопки сохраняются и проверяются', () => {
+  const preset = { id: 'p', label: 'Стики', emoji: '🚬', type: 'expense', categoryId: 'exp-tobacco', amounts: [23000], order: 1 };
+  const data = { transactions: [], categories: L.defaultCategories(), recurring: [], debts: [], presets: [preset] };
+  assert.deepEqual(L.parseBackup(JSON.stringify(L.makeBackup(data))).presets, [preset]);
+  const bad = L.makeBackup({ ...data, presets: [{ ...preset, amounts: [] }] });
+  assert.throws(() => L.parseBackup(JSON.stringify(bad)), /быстрая кнопка №1/);
 });

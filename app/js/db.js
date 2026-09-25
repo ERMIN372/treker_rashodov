@@ -1,7 +1,7 @@
 // Тонкая обёртка над IndexedDB. Данные живут только на этом устройстве.
 const DB_NAME = 'treker-rashodov';
-const DB_VERSION = 2; // 2 — долги
-const DATA_STORES = ['transactions', 'categories', 'recurring', 'debts'];
+const DB_VERSION = 3; // 2 — долги, 3 — быстрые кнопки
+const DATA_STORES = ['transactions', 'categories', 'recurring', 'debts', 'presets'];
 const ALL_STORES = [...DATA_STORES, 'meta'];
 
 let dbPromise = null;
@@ -19,6 +19,7 @@ function openDB() {
         d.createObjectStore('meta', { keyPath: 'key' });
       }
       if (e.oldVersion < 2) d.createObjectStore('debts', { keyPath: 'id' });
+      if (e.oldVersion < 3) d.createObjectStore('presets', { keyPath: 'id' });
     };
     req.onsuccess = () => {
       const d = req.result;
