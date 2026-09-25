@@ -966,3 +966,26 @@ html.privacy body > :not(#lock) { visibility: hidden; }
 .form-error.left { margin: -4px 0 12px; text-align: left; }
 
 .hint.tip { margin: -6px 0 12px; }
+
+/* ---------- Долги ---------- */
+
+.debts-summary { padding-top: 0; border-top: 0; }
+
+.debts-summary .side-value { font-size: 22px; }
+
+.row.static { cursor: default; }
+
+.row.static:active { background: none; }
+
+.payments { display: flex; flex-direction: column; gap: 8px; }
+
+.payments .row { min-height: 48px; }
+
+.tab span:not(.sync-dot) { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Пять вкладок на узких экранах */
+@media (max-width: 374px) {
+  .tabbar { padding-left: 2px; padding-right: 2px; }
+  .tab { font-size: 9.5px; letter-spacing: -0.02em; }
+  .tab svg { width: 24px; height: 24px; }
+}

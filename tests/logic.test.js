@@ -190,7 +190,7 @@ test('резервная копия: туда и обратно, битые фа
     recurring: [{ id: 'r1', type: 'expense', amount: 29900, categoryId: 'exp-subs', startDate: '2026-01-05', period: 'monthly', lastDate: null, active: true }],
   };
   const restored = L.parseBackup(JSON.stringify(L.makeBackup(data, new Date('2026-09-24T10:00:00Z'))));
-  assert.deepEqual(restored, data);
+  assert.deepEqual(restored, { ...data, debts: [] }, 'старые копии без долгов читаются');
 
   assert.throws(() => L.parseBackup('не json'), /JSON/);
   assert.throws(() => L.parseBackup('{"a":1}'), /не резервная копия/);

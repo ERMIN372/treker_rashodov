@@ -228,3 +228,41 @@ test('синхронизация: повреждённый файл в репо 
   await assert.rejects(phone.syncWith(gh), /посторонний/);
   assert.equal(gh.text, '{"oops": true}');
 });
+
+test('долги: остаток, закрытие, просрочка, сводка', () => {
+  const d = { id: 'd', direction: 'lent', person: 'Лёха', amount: 150000, date: '2026-09-01', dueDate: '2026-09-20', payments: [{ id: 'p1', amount: 50000, date: '2026-09-10' }] };
+  assert.equal(L.debtRemaining(d), 100000);
+  assert.equal(L.isDebtOverdue(d, '2026-09-25'), true);
+  assert.equal(L.isDebtOverdue(d, '2026-09-20'), false);
+  const paid = { ...d, payments: [...d.payments, { id: 'p2', amount: 100000, date: '2026-09-25' }] };
+  assert.equal(L.isDebtClosed(paid), true);
+  assert.equal(L.isDebtOverdue(paid, '2026-12-01'), false, 'закрытый не просрочен');
+  const removed = { ...paid, removedPayments: ['p2'] };
+  assert.equal(L.debtRemaining(removed), 100000, 'удалённый возврат не считается');
+  const owe = { id: 'o', direction: 'owe', person: 'Мама', amount: 30000, date: '2026-09-02' };
+  assert.deepEqual(L.summarizeDebts([d, owe]), { lent: 100000, owe: 30000, net: 70000 });
+  assert.deepEqual(L.sortDebts([owe, d], '2026-09-25').map((x) => x.id), ['d', 'o'], 'просроченный сверху');
+  assert.deepEqual(L.debtPeople([d, owe, { ...owe, id: 'o2' }]), ['Мама', 'Лёха']);
+});
+
+test('долги: возвраты с двух устройств объединяются при слиянии', () => {
+  const base = { id: 'd', direction: 'lent', person: 'Лёха', amount: 150000, date: '2026-09-01', payments: [] };
+  const phone = { ...base, payments: [{ id: 'a', amount: 30000, date: '2026-09-10' }], updatedAt: 10 };
+  const pc = { ...base, payments: [{ id: 'b', amount: 20000, date: '2026-09-11' }], note: 'такси', updatedAt: 11 };
+  const merged = L.resolveRecord(phone, pc, 'debts');
+  assert.equal(merged.note, 'такси', 'поля — от свежей версии');
+  assert.deepEqual(merged.payments.map((p) => p.id), ['a', 'b'], 'оба возврата на месте');
+  assert.deepEqual(L.resolveRecord(pc, phone, 'debts'), merged, 'результат не зависит от порядка');
+  const undone = { ...merged, removedPayments: ['a'], updatedAt: 12 };
+  const again = L.resolveRecord(undone, phone, 'debts');
+  assert.equal(L.debtRemaining(again), 130000, 'удалённый на одном устройстве возврат не воскресает');
+});
+
+test('синхронизация: старый файл без долгов читается, долги валидируются', () => {
+  const old = JSON.stringify({ format: L.SYNC_FORMAT, version: 1, transactions: [], categories: [], recurring: [] });
+  assert.deepEqual(L.parseSyncData(old).debts, []);
+  const bad = JSON.stringify({ format: L.SYNC_FORMAT, version: 1, transactions: [], categories: [], recurring: [], debts: [{ id: 'x', direction: 'lent', person: '', amount: 1, date: '2026-09-01' }] });
+  assert.throws(() => L.parseSyncData(bad), /долг №1/);
+  const text = L.serializeSync({ transactions: [], categories: [], recurring: [] });
+  assert.ok(text.includes('"debts": ['));
+});
